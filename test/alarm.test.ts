@@ -104,6 +104,52 @@ describe("nightly lock alarm", () => {
     expect(await alarmAt(stub)).toBe(NEXT_DAY);
   });
 
+  it("keeps tonight's run when the cron fires at 22:00:30 before the alarm", async () => {
+    const tesla = new FakeTesla();
+    const stub = await setup(tesla);
+    await runInDurableObject(stub, (instance: OwnerState) => {
+      instance.clock = () => RUN_AT + 30_000;
+    });
+    expect(await stub.ensureAlarm()).toEqual({ nextRun: new Date(RUN_AT).toISOString() });
+    expect(await alarmAt(stub)).toBe(RUN_AT);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.locked).toBe(true);
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ localDate: "2030-06-15", outcome: "ok" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+    // Once handled, the next cron tick moves on to tomorrow.
+    expect(await stub.ensureAlarm()).toEqual({ nextRun: new Date(NEXT_DAY).toISOString() });
+  });
+
+  it("runs a late alarm within three hours, even after a cron tick", async () => {
+    const tesla = new FakeTesla();
+    const stub = await setup(tesla);
+    await runInDurableObject(stub, (instance: OwnerState) => {
+      instance.clock = () => RUN_AT + 2 * 60 * 60_000;
+    });
+    expect(await stub.ensureAlarm()).toEqual({ nextRun: new Date(RUN_AT).toISOString() });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.locked).toBe(true);
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ localDate: "2030-06-15", outcome: "ok" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+  });
+
+  it("audits a run more than three hours late as missed and schedules tomorrow", async () => {
+    const tesla = new FakeTesla();
+    const stub = await setup(tesla);
+    await runInDurableObject(stub, (instance: OwnerState) => {
+      instance.clock = () => RUN_AT + 3 * 60 * 60_000 + 60_000;
+    });
+    // The cron keeps the overdue run so the alarm can record it as missed.
+    expect(await stub.ensureAlarm()).toEqual({ nextRun: new Date(RUN_AT).toISOString() });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.commands).toBe(0);
+    expect(tesla.fleetRequests).toHaveLength(0);
+    const [row] = await stub.auditRecent(1);
+    expect(row).toMatchObject({ source: "alarm", action: "nightly_lock", outcome: "error", detail: "missed" });
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ localDate: "2030-06-15", outcome: "error" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+  });
+
   it("respects NIGHTLY_LOCK_ENABLED", async () => {
     const tesla = new FakeTesla();
     tesla.install();

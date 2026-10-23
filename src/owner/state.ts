@@ -572,7 +572,9 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   /** Idempotent: set the alarm to the next nightly run unless it already is.
-   * Called by the cron trigger every 15 minutes and after each run. */
+   * Called by the cron trigger every 15 minutes and after each run. A run that
+   * is due but not yet handled is never moved: its alarm may be delivered (or
+   * retried) after a cron tick, and alarm() runs it late or audits it missed. */
   async ensureAlarm(): Promise<{ nextRun: string | null }> {
     const config = this.nightlyConfig();
     if (!config.enabled) {
@@ -580,7 +582,17 @@ export class OwnerState extends DurableObject<Env> {
       this.kvDelete("scheduled_for");
       return { nextRun: null };
     }
-    const next = computeNextRun(new Date(this.clock()), config.time, config.timeZone).getTime();
+    const now = this.clock();
+    const scheduled = Number(this.kvGet("scheduled_for") ?? Number.NaN);
+    if (
+      Number.isFinite(scheduled) &&
+      scheduled <= now &&
+      this.kvGet("last_run_local_date") !== localDateString(scheduled, config.timeZone)
+    ) {
+      if ((await this.ctx.storage.getAlarm()) !== scheduled) await this.ctx.storage.setAlarm(scheduled);
+      return { nextRun: new Date(scheduled).toISOString() };
+    }
+    const next = computeNextRun(new Date(now), config.time, config.timeZone).getTime();
     if ((await this.ctx.storage.getAlarm()) !== next) {
       await this.ctx.storage.setAlarm(next);
     }
@@ -613,13 +625,7 @@ export class OwnerState extends DurableObject<Env> {
     try {
       if (now - target > MISSED_WINDOW_MS) {
         this.recordLastRun(runDate, "error", "skipped: alarm fired too late");
-        this.audit({
-          source: "alarm",
-          action: "nightly_lock",
-          vehicleId: null,
-          outcome: "error",
-          detail: "missed_window",
-        });
+        this.audit({ source: "alarm", action: "nightly_lock", vehicleId: null, outcome: "error", detail: "missed" });
         return;
       }
       const result = await this.inLane(() => this.lockFlow("alarm", undefined, NIGHTLY_LOCK_POLICY));
