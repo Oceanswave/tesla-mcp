@@ -14,7 +14,8 @@ and of the lock retry logic matters more than speed.
   "your ... URL" mention in the README self-host section.
 - TypeScript strict, ESM. npm with a committed `package-lock.json`; pin exact dependency versions. Biome for lint
   and format.
-- New vehicle commands: add them to `SIGNED_COMMANDS` in `src/tesla/vcp/protocol.ts` with test vectors. Anything
+- New vehicle commands: add them to `SIGNED_COMMANDS` in `src/tesla/vcp/protocol.ts` with test vectors, and extend
+  `test/vectors/vcsec-lock.json` (or a sibling file) plus `conformance/go/` so Tesla's Go code checks them. Anything
   that unlocks, opens, starts, or weakens security must declare a `dangerousAction` (see `src/mcp/dangerous.ts`)
   so it stays unregistered unless `DANGEROUS_COMMANDS_ENABLED` is `"true"`.
 - Every state-changing tool requires `confirm: true` and supports `dryRun: true` (via `commandGate` in
@@ -31,8 +32,10 @@ and of the lock retry logic matters more than speed.
 - `src/tesla/`: Fleet REST client, bounded HTTP helpers, and `vcp/` (Vehicle Command Protocol codec, crypto, and
   the per-VIN `TeslaVcpSession` Durable Object).
 - `test/`: Workers-runtime tests with a simulated Tesla in `test/helpers/fake-tesla.ts`.
+- `conformance/`: a Go test compiled inside a pinned checkout of Tesla's `vehicle-command` (its signer is in
+  `internal/`) that rebuilds `test/vectors/vcsec-lock.json` with Tesla's code.
 
 ## Checks
 
-Run `npm run check` (typecheck, lint, test) and `npm run deploy:dry` before finishing. Regenerate VCSEC vectors
+Run `npm run check` (typecheck, lint, test), `npm run deploy:dry`, and `bash conformance/run.sh` before finishing. Regenerate VCSEC vectors
 with `scripts/vcsec_vectors.py` if the signer's encoding changes on purpose.

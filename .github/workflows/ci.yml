@@ -58,6 +58,20 @@ jobs:
       - name: Scan git history
         run: gitleaks git --redact --exit-code 1 .
 
+  go-conformance:
+    runs-on: [self-hosted, Linux, X64, tesla-mcp]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.27.3"
+          cache: false
+      - name: Check vectors against Tesla's vehicle-command (pinned commit)
+        run: bash conformance/run.sh
+
   deploy-dry-run:
     uses: Oceanswave/github-workflows/.github/workflows/wrangler-deploy.yml@125b14d3312b525c8f5b42e9f1c7a9e172d1b23f
     with:

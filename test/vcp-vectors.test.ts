@@ -1,19 +1,24 @@
 // Cross-language vectors: the TypeScript signer must produce exactly the bytes
-// the owner's production Python plugin produces for a VCSEC lock. Regenerate
-// with scripts/vcsec_vectors.py. The keys are the private scalars 1 (client)
-// and 2 (vehicle), assembled here at runtime; no key file is committed.
+// the owner's production Python plugin produces for a VCSEC lock (regenerate
+// with scripts/vcsec_vectors.py) and the bytes in test/vectors/vcsec-lock.json,
+// which conformance/run.sh checks against Tesla's official Go implementation.
+// The keys are the private scalars 1 (client) and 2 (vehicle), assembled here
+// at runtime; no key file is committed.
 
 import { describe, expect, it } from "vitest";
 import { bytesFromHex, bytesToBase64, bytesToHex, concatBytes } from "../src/bytes";
 import {
+  decryptAesGcmResponse,
   deriveSessionInfoKey,
   deriveSessionKey,
   deriveSigningKey,
   hmacSha256,
   importVcpPrivateKey,
+  sha256Digest,
 } from "../src/tesla/vcp/crypto";
 import {
   buildSessionInfoRequest,
+  buildSignedCommand,
   buildVcsecLockPayload,
   DOMAIN_INFOTAINMENT,
   DOMAIN_VEHICLE_SECURITY,
@@ -21,10 +26,13 @@ import {
   encodeLengthDelimited,
   encodeResponseMetadata,
   encodeSessionInfoMetadata,
+  parseRoutableResponse,
+  parseSessionInfo,
   responseRequestHash,
   SIGNED_COMMANDS,
 } from "../src/tesla/vcp/protocol";
-import { TeslaVcpCore } from "../src/tesla/vcp/session";
+import { TeslaVcpCore, VcpError } from "../src/tesla/vcp/session";
+import TESLA from "./vectors/vcsec-lock.json";
 
 const PY = {
   client_pub:
@@ -155,37 +163,181 @@ describe("VCSEC lock vectors match the Python plugin", () => {
   });
 
   it("sends byte-identical handshake and signed lock through the full session core", async () => {
-    const randoms = [ROUTING, UUID_HANDSHAKE, UUID_COMMAND];
-    const sent: string[] = [];
-    const now = 1_900_000_000_000;
-    const core = new TeslaVcpCore({
-      fleetBaseUrl: "https://fleet-api.tesla.test",
-      privateKeyPkcs8Base64: CLIENT.pkcs8Base64,
-      publicKeyPem: CLIENT.publicKeyPem,
-      now: () => now,
-      randomBytes16: () => randoms.shift() as Uint8Array,
-      sleep: async () => {},
-      fetchFn: async (input, init) => {
-        expect(String(input)).toBe(`https://fleet-api.tesla.test/api/1/vehicles/${VIN}/signed_command`);
-        const message = JSON.parse(String(init?.body)).routable_message as string;
-        sent.push(bytesToHex(Uint8Array.from(atob(message), (c) => c.charCodeAt(0))));
-        const response =
-          sent.length === 1
-            ? concatBytes(
-                encodeLengthDelimited(
-                  13,
-                  encodeLengthDelimited(6, encodeLengthDelimited(1, bytesFromHex(PY.session_info_tag))),
-                ),
-                encodeLengthDelimited(15, bytesFromHex(PY.session_info)),
-                encodeLengthDelimited(50, UUID_HANDSHAKE),
-              )
-            : // Completion: an empty FromVCSECMessage (a bare CommandStatus is
-              // only an acknowledgement).
-              encodeLengthDelimited(50, UUID_COMMAND);
-        return Response.json({ response: bytesToBase64(response) });
-      },
-    });
-    await core.command({ vin: VIN, accessToken: "test-access-token-0123456789", command: "door_lock" });
+    // Completion: an empty FromVCSECMessage (a bare CommandStatus is only an
+    // acknowledgement).
+    const sent = await lockThroughCore(encodeLengthDelimited(50, UUID_COMMAND));
     expect(sent).toEqual([PY.handshake_request, PY.lock_routable_message]);
+  });
+});
+
+/** Run door_lock through TeslaVcpCore against a fake Fleet endpoint that
+ * answers the handshake with the vector session info and the command with
+ * `commandReply`. Returns (and records in `sent`) the hex of every
+ * RoutableMessage sent. */
+async function lockThroughCore(commandReply: Uint8Array, sent: string[] = []): Promise<string[]> {
+  const randoms = [ROUTING, UUID_HANDSHAKE, UUID_COMMAND];
+  const now = 1_900_000_000_000;
+  const core = new TeslaVcpCore({
+    fleetBaseUrl: "https://fleet-api.tesla.test",
+    privateKeyPkcs8Base64: CLIENT.pkcs8Base64,
+    publicKeyPem: CLIENT.publicKeyPem,
+    now: () => now,
+    randomBytes16: () => randoms.shift() as Uint8Array,
+    sleep: async () => {},
+    fetchFn: async (input, init) => {
+      expect(String(input)).toBe(`https://fleet-api.tesla.test/api/1/vehicles/${VIN}/signed_command`);
+      const message = JSON.parse(String(init?.body)).routable_message as string;
+      sent.push(bytesToHex(Uint8Array.from(atob(message), (c) => c.charCodeAt(0))));
+      const response =
+        sent.length === 1
+          ? concatBytes(
+              encodeLengthDelimited(
+                13,
+                encodeLengthDelimited(6, encodeLengthDelimited(1, bytesFromHex(PY.session_info_tag))),
+              ),
+              encodeLengthDelimited(15, bytesFromHex(PY.session_info)),
+              encodeLengthDelimited(50, UUID_HANDSHAKE),
+            )
+          : commandReply;
+      return Response.json({ response: bytesToBase64(response) });
+    },
+  });
+  await core.command({ vin: VIN, accessToken: "test-access-token-0123456789", command: "door_lock" });
+  return sent;
+}
+
+// Every value below was produced by Tesla's own Go code at the commit pinned in
+// conformance/run.sh; that check runs in CI as the go-conformance job.
+describe("VCSEC vectors match Tesla's vehicle-command (Go)", () => {
+  const [lock, lockEncryptResponse] = TESLA.commands;
+  if (!lock || !lockEncryptResponse) throw new Error("missing command vectors");
+  const reply = TESLA.encrypted_response;
+
+  it("shares inputs with the Python vectors", () => {
+    expect(TESLA.inputs.vin).toBe(VIN);
+    expect(TESLA.inputs.domain).toBe(DOMAIN_VEHICLE_SECURITY);
+    expect(TESLA.inputs.epoch).toBe(bytesToHex(EPOCH));
+    expect(TESLA.inputs.routing_address).toBe(bytesToHex(ROUTING));
+    expect(TESLA.inputs.handshake_uuid).toBe(bytesToHex(UUID_HANDSHAKE));
+    expect([TESLA.inputs.client_scalar, TESLA.inputs.vehicle_scalar]).toEqual([1, 2]);
+    expect(lock.command_uuid).toBe(bytesToHex(UUID_COMMAND));
+    expect(lock.flags).toBe(SIGNED_COMMANDS.door_lock.flags);
+    expect(TESLA.lock_payload).toBe(PY.lock_payload);
+  });
+
+  it("derives Tesla's public points and session keys", async () => {
+    const client = await importVcpPrivateKey(CLIENT.pkcs8Base64, CLIENT.publicKeyPem);
+    expect(bytesToHex(client.publicKey)).toBe(TESLA.derived.client_public_point);
+    const vehicle = await importVcpPrivateKey(VEHICLE.pkcs8Base64, VEHICLE.publicKeyPem);
+    expect(bytesToHex(vehicle.publicKey)).toBe(TESLA.derived.vehicle_public_point);
+    const sessionKey = await deriveSessionKey(client.privateKey, vehicle.publicKey);
+    expect(bytesToHex(sessionKey)).toBe(TESLA.derived.ecdh_sha1_128);
+    expect(bytesToHex(await deriveSessionKey(vehicle.privateKey, client.publicKey))).toBe(TESLA.derived.ecdh_sha1_128);
+    expect(bytesToHex(await deriveSigningKey(sessionKey))).toBe(TESLA.derived.hmac_command);
+    expect(bytesToHex(await deriveSessionInfoKey(sessionKey))).toBe(TESLA.derived.hmac_session_info);
+  });
+
+  it("builds Tesla's handshake and verifies the session info its Verifier signs", async () => {
+    expect(
+      bytesToHex(
+        buildSessionInfoRequest(
+          bytesFromHex(TESLA.derived.client_public_point),
+          ROUTING,
+          UUID_HANDSHAKE,
+          DOMAIN_VEHICLE_SECURITY,
+        ),
+      ),
+    ).toBe(TESLA.handshake.request);
+    const info = parseSessionInfo(bytesFromHex(TESLA.handshake.session_info));
+    expect(info.counter).toBe(TESLA.inputs.session_counter);
+    expect(info.clockTime).toBe(TESLA.inputs.clock_time);
+    expect(bytesToHex(info.epoch)).toBe(TESLA.inputs.epoch);
+    expect(bytesToHex(info.publicKey)).toBe(TESLA.derived.vehicle_public_point);
+    const tag = await hmacSha256(
+      bytesFromHex(TESLA.derived.hmac_session_info),
+      encodeSessionInfoMetadata(VIN, UUID_HANDSHAKE),
+      new Uint8Array([0xff]),
+      bytesFromHex(TESLA.handshake.session_info),
+    );
+    expect(bytesToHex(tag)).toBe(TESLA.handshake.session_info_tag);
+  });
+
+  for (const command of TESLA.commands) {
+    it(`signs lock counter ${command.counter} flags ${command.flags} exactly as Tesla's Signer`, async () => {
+      expect(command.expires_at).toBe(TESLA.inputs.clock_time + TESLA.inputs.ttl_seconds);
+      const payload = buildVcsecLockPayload();
+      expect(bytesToHex(payload)).toBe(TESLA.lock_payload);
+      const metadata = encodeCommandMetadata({
+        vin: VIN,
+        epoch: EPOCH,
+        expiresAt: command.expires_at,
+        counter: command.counter,
+        domain: DOMAIN_VEHICLE_SECURITY,
+        flags: command.flags,
+      });
+      expect(bytesToHex(metadata)).toBe(command.metadata);
+      const tag = await hmacSha256(bytesFromHex(TESLA.derived.hmac_command), metadata, new Uint8Array([0xff]), payload);
+      expect(bytesToHex(tag)).toBe(command.tag);
+      const message = buildSignedCommand({
+        publicKey: bytesFromHex(TESLA.derived.client_public_point),
+        routingAddress: ROUTING,
+        uuid: bytesFromHex(command.command_uuid),
+        payload,
+        epoch: EPOCH,
+        counter: command.counter,
+        expiresAt: command.expires_at,
+        tag,
+        domain: DOMAIN_VEHICLE_SECURITY,
+        flags: command.flags,
+      });
+      expect(bytesToHex(message)).toBe(command.routable_message);
+      expect(bytesToHex(responseRequestHash(DOMAIN_VEHICLE_SECURITY, tag))).toBe(command.request_hash);
+    });
+  }
+
+  it("authenticates and decrypts a response encrypted by Tesla's Verifier", async () => {
+    const response = parseRoutableResponse(bytesFromHex(reply.routable_message));
+    expect(response.fromDomain).toBe(DOMAIN_VEHICLE_SECURITY);
+    expect(response.requestUuid && bytesToHex(response.requestUuid)).toBe(lock.command_uuid);
+    expect(response.responseCounter).toBe(reply.counter);
+    expect(response.flags).toBe(reply.flags);
+    expect(response.fault).toBe(reply.fault);
+    const metadata = encodeResponseMetadata({
+      vin: VIN,
+      domain: DOMAIN_VEHICLE_SECURITY,
+      counter: reply.counter,
+      flags: reply.flags,
+      requestHash: bytesFromHex(lock.request_hash),
+      fault: reply.fault,
+    });
+    expect(bytesToHex(metadata)).toBe(reply.metadata);
+    const plaintext = await decryptAesGcmResponse(
+      bytesFromHex(TESLA.derived.ecdh_sha1_128),
+      response.responseNonce ?? new Uint8Array(),
+      response.payload ?? new Uint8Array(),
+      response.responseTag ?? new Uint8Array(),
+      await sha256Digest(metadata, new Uint8Array([0xff])),
+    );
+    expect(bytesToHex(plaintext)).toBe(reply.plaintext);
+  });
+
+  it("authenticates a Tesla-built handshake and encrypted reply end to end", async () => {
+    // The reply decrypts to a bare CommandStatus(OK): authenticated, but only
+    // an acknowledgement, so the core asks the caller to check the car.
+    const sent: string[] = [];
+    const acknowledged = await lockThroughCore(bytesFromHex(reply.routable_message), sent).catch(
+      (caught: unknown) => caught,
+    );
+    expect(acknowledged).toBeInstanceOf(VcpError);
+    expect(acknowledged).toMatchObject({ code: "status_unknown", stage: "vcsec_acknowledged" });
+    expect(sent).toEqual([TESLA.handshake.request, lock.routable_message]);
+
+    // Flip one bit of the AES-GCM tag: the core must refuse to trust the reply.
+    const flipped = (Number.parseInt(reply.tag.slice(0, 2), 16) ^ 1).toString(16).padStart(2, "0");
+    const tampered = bytesFromHex(reply.routable_message.replace(reply.tag, `${flipped}${reply.tag.slice(2)}`));
+    expect(bytesToHex(tampered)).not.toBe(reply.routable_message);
+    const error = await lockThroughCore(tampered).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(VcpError);
+    expect(error).toMatchObject({ code: "status_unknown", stage: "command_response_authentication" });
   });
 });

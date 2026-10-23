@@ -1,0 +1,64 @@
+{
+  "description": "VCSEC lock vectors shared by test/vcp-vectors.test.ts and conformance/go (Tesla's vehicle-command). Keys are the public test scalars 1 and 2; nothing here is a real credential.",
+  "inputs": {
+    "client_scalar": 1,
+    "vehicle_scalar": 2,
+    "vin": "5YJ3E1EA1NF000001",
+    "domain": 2,
+    "epoch": "000102030405060708090a0b0c0d0e0f",
+    "routing_address": "202122232425262728292a2b2c2d2e2f",
+    "handshake_uuid": "404142434445464748494a4b4c4d4e4f",
+    "session_counter": 7,
+    "clock_time": 1000,
+    "ttl_seconds": 15
+  },
+  "derived": {
+    "client_public_point": "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+    "vehicle_public_point": "047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1",
+    "ecdh_sha1_128": "b59d61fedc3b7a1ee22fde1780a59522",
+    "hmac_command": "62bae25f96a2ec94e54651e6b0ca389c56d230f6bbf5a1b21fef11d12cf7d44b",
+    "hmac_session_info": "45b2513c0595df7bf4a8313e3c654835446cf99fbb979ff9864447000da07567"
+  },
+  "handshake": {
+    "request": "320208023a121210202122232425262728292a2b2c2d2e2f72430a41046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f59a0310404142434445464748494a4b4c4d4e4f",
+    "session_info": "08071241047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d11a10000102030405060708090a0b0c0d0e0f25e8030000",
+    "session_info_tag": "397a81d849eaacd4da2fc0072a3e0ff91085c094ebc2817d5856e2e04cca2366"
+  },
+  "lock_payload": "1001",
+  "commands": [
+    {
+      "description": "door_lock as this Worker sends it (no flags, plaintext VCSEC reply)",
+      "counter": 8,
+      "expires_at": 1015,
+      "flags": 0,
+      "command_uuid": "303132333435363738393a3b3c3d3e3f",
+      "metadata": "000108010102021135594a3345314541314e463030303030310310000102030405060708090a0b0c0d0e0f0404000003f7050400000008",
+      "tag": "edcc29435c1fc87e36479bdb209b132e344a3f8a5f2e654112d0aaeeada015ed",
+      "routable_message": "320208023a121210202122232425262728292a2b2c2d2e2f520210016a82010a430a41046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5423b0a10000102030405060708090a0b0c0d0e0f10081df70300002220edcc29435c1fc87e36479bdb209b132e344a3f8a5f2e654112d0aaeeada015ed9a0310303132333435363738393a3b3c3d3e3f",
+      "request_hash": "08edcc29435c1fc87e36479bdb209b132e"
+    },
+    {
+      "description": "the same lock with FLAG_ENCRYPT_RESPONSE, the flags Tesla's Go client sets by default",
+      "counter": 9,
+      "expires_at": 1015,
+      "flags": 2,
+      "command_uuid": "505152535455565758595a5b5c5d5e5f",
+      "metadata": "000108010102021135594a3345314541314e463030303030310310000102030405060708090a0b0c0d0e0f0404000003f7050400000009070400000002",
+      "tag": "1ff9d31a6dadec16a567f4fed982403e5ea4a71a70d3e40034fed9d8ecdc4842",
+      "routable_message": "320208023a121210202122232425262728292a2b2c2d2e2f520210016a82010a430a41046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5423b0a10000102030405060708090a0b0c0d0e0f10091df703000022201ff9d31a6dadec16a567f4fed982403e5ea4a71a70d3e40034fed9d8ecdc48429a0310505152535455565758595a5b5c5d5e5fa00302",
+      "request_hash": "081ff9d31a6dadec16a567f4fed982403e"
+    }
+  ],
+  "encrypted_response": {
+    "description": "AES-GCM reply to the flags-0 lock, as Tesla's Verifier.Encrypt builds it but with a fixed nonce",
+    "counter": 1,
+    "flags": 0,
+    "fault": 0,
+    "nonce": "606162636465666768696a6b",
+    "plaintext": "2200",
+    "metadata": "000109010102021135594a3345314541314e46303030303031050400000001070400000000081108edcc29435c1fc87e36479bdb209b132e090400000000",
+    "ciphertext": "da7c",
+    "tag": "2cd2d5394db7a9e28fc4dd1b9ea5659b",
+    "routable_message": "32121210202122232425262728292a2b2c2d2e2f3a0208025202da7c6a244a220a0c606162636465666768696a6b10011a102cd2d5394db7a9e28fc4dd1b9ea5659b920310303132333435363738393a3b3c3d3e3f"
+  }
+}
