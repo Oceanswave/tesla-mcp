@@ -14,28 +14,39 @@ function deps(options: {
   states: (string | null)[];
   locks: SignedCommandResult[];
   locked?: boolean | null | (boolean | null)[];
+  /** Simulated Tesla latency added to the clock on every call. */
+  latencyMs?: number;
 }) {
-  const calls = { wake: 0, lock: 0, state: 0, isLocked: 0, slept: 0 };
+  const calls = { wake: 0, lock: 0, state: 0, isLocked: 0, slept: 0, clock: 0 };
+  const latency = () => {
+    calls.clock += options.latencyMs ?? 0;
+  };
   const d: LockDeps = {
     getState: async () => {
+      latency();
       calls.state++;
       return options.states.length > 1 ? (options.states.shift() ?? null) : (options.states[0] ?? null);
     },
     wake: async () => {
+      latency();
       calls.wake++;
     },
     sendLock: async () => {
+      latency();
       calls.lock++;
       return options.locks.shift() ?? fail("vehicle_unavailable");
     },
     isLocked: async () => {
+      latency();
       calls.isLocked++;
       if (Array.isArray(options.locked)) return options.locked.shift() ?? null;
       return options.locked ?? null;
     },
     sleep: async (milliseconds) => {
       calls.slept += milliseconds;
+      calls.clock += milliseconds;
     },
+    now: () => calls.clock,
   };
   return { d, calls };
 }
@@ -132,5 +143,38 @@ describe("lockWithRetry", () => {
       expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY)).toMatchObject({ ok: false, code, attempts: 1 });
       expect(calls.lock).toBe(1);
     }
+  });
+
+  it("stops starting new work once the time budget is spent, counting Tesla's latency", async () => {
+    // Every call takes 60 s: sleeps alone would allow far more than the
+    // Durable Object alarm's 15-minute limit.
+    const { d, calls } = deps({ states: ["asleep"], locks: [], latencyMs: 60_000 });
+    const outcome = await lockWithRetry(d, NIGHTLY_LOCK_POLICY);
+    expect(outcome).toMatchObject({ ok: false, woke: true });
+    expect(outcome.ok === false && outcome.detail).toMatch(/time_budget_exhausted$/);
+    // Nothing starts after the budget; at most the call in flight finishes.
+    expect(calls.clock).toBeLessThanOrEqual(NIGHTLY_LOCK_POLICY.budgetMs + 2 * 60_000);
+    expect(calls.lock).toBeLessThan(NIGHTLY_LOCK_POLICY.maxAttempts);
+  });
+
+  it("checks the lock state first when asked and sends nothing if already locked", async () => {
+    const { d, calls } = deps({ states: ["online"], locks: [ok], locked: true });
+    expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY, { checkLockedFirst: true })).toEqual({
+      ok: true,
+      detail: "already_locked",
+      attempts: 0,
+      woke: false,
+    });
+    expect(calls.lock).toBe(0);
+  });
+
+  it("still locks when the first check finds the car unlocked", async () => {
+    const { d, calls } = deps({ states: ["online"], locks: [ok], locked: false });
+    expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY, { checkLockedFirst: true })).toMatchObject({
+      ok: true,
+      detail: "locked",
+      attempts: 1,
+    });
+    expect(calls.lock).toBe(1);
   });
 });

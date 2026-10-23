@@ -8,8 +8,22 @@ import type { Env } from "../env";
 import { FleetClient, FleetError, summarizeVehicleData, type VehicleSummary } from "../tesla/fleet";
 import { defaultFetch, type FetchFn, fetchUpstream, readBoundedText } from "../tesla/http";
 import type { SignedCommandResult } from "../tesla/vcp/session";
-import { INTERACTIVE_LOCK_POLICY, type LockOutcome, type LockPolicy, lockWithRetry, NIGHTLY_LOCK_POLICY } from "./lock";
-import { computeNextRun, localDateString, localParts, parseLocalTime, validTimeZone } from "./schedule";
+import {
+  INTERACTIVE_LOCK_POLICY,
+  type LockOptions,
+  type LockOutcome,
+  type LockPolicy,
+  lockWithRetry,
+  NIGHTLY_LOCK_POLICY,
+} from "./lock";
+import {
+  computeLatestRun,
+  computeNextRun,
+  localDateString,
+  localParts,
+  parseLocalTime,
+  validTimeZone,
+} from "./schedule";
 import { decryptTokens, encryptTokens, importTokenKey, type StoredTokens } from "./tokens";
 
 const REFRESH_MARGIN_MS = 5 * 60_000;
@@ -525,6 +539,7 @@ export class OwnerState extends DurableObject<Env> {
     vehicleId: string | undefined,
     policy: LockPolicy,
     rethrowUnexpected = false,
+    options: LockOptions = {},
   ): Promise<OwnerResult<LockSuccess>> {
     let resolvedId: string | null = vehicleId ?? null;
     try {
@@ -572,8 +587,10 @@ export class OwnerState extends DurableObject<Env> {
             }
           },
           sleep: (milliseconds) => this.sleep(milliseconds),
+          now: () => this.clock(),
         },
         policy,
+        options,
       );
       const detail = `${outcome.ok ? outcome.detail : `${outcome.code} ${outcome.detail}`} attempts=${outcome.attempts}${outcome.woke ? " woke" : ""}`;
       this.audit({ source, action: "lock", vehicleId: vehicle.id, outcome: outcome.ok ? "ok" : "error", detail });
@@ -632,7 +649,22 @@ export class OwnerState extends DurableObject<Env> {
       if ((await this.ctx.storage.getAlarm()) !== scheduled) await this.ctx.storage.setAlarm(scheduled);
       return { nextRun: new Date(scheduled).toISOString() };
     }
-    const next = computeNextRun(new Date(now), config.time, config.timeZone).getTime();
+    let next = computeNextRun(new Date(now), config.time, config.timeZone).getTime();
+    if (Number.isFinite(scheduled)) {
+      // Catch up after an outage: when the last scheduled run is older than
+      // the latest due one (say yesterday's alarm was only delivered tonight
+      // at 22:30 and audited as missed), run tonight's now if it is still
+      // within the window instead of skipping to tomorrow. Never on first
+      // deploy (nothing scheduled yet), so deploying late does not lock.
+      const latest = computeLatestRun(new Date(now), config.time, config.timeZone).getTime();
+      if (
+        latest > scheduled &&
+        now - latest <= MISSED_WINDOW_MS &&
+        !this.nightlyDone(localDateString(latest, config.timeZone))
+      ) {
+        next = latest;
+      }
+    }
     if ((await this.ctx.storage.getAlarm()) !== next) {
       await this.ctx.storage.setAlarm(next);
     }
@@ -715,7 +747,10 @@ export class OwnerState extends DurableObject<Env> {
     this.nightlyInFlight = true;
     try {
       // An unexpected error propagates and leaves the run pending.
-      result = await this.inLane(() => this.lockFlow("alarm", undefined, NIGHTLY_LOCK_POLICY, true));
+      // A resumed run may have locked the car before it was interrupted.
+      result = await this.inLane(() =>
+        this.lockFlow("alarm", undefined, NIGHTLY_LOCK_POLICY, true, { checkLockedFirst: resumed !== null }),
+      );
     } finally {
       this.nightlyInFlight = false;
     }
@@ -757,15 +792,13 @@ export class OwnerState extends DurableObject<Env> {
   async nightlyLockStatus(): Promise<NightlyLockStatus> {
     const config = this.nightlyConfig();
     const now = this.clock();
-    const scheduled = Number(this.kvGet("scheduled_for") ?? Number.NaN);
+    // Report the alarm actually armed, not a computed time: right after a
+    // deploy nothing is armed until the first cron tick calls ensureAlarm.
+    const armed = await this.ctx.storage.getAlarm();
     let nextRun: NightlyLockStatus["nextRun"] = null;
     let localNow = new Date(now).toISOString();
     if (config.enabled) {
-      const next =
-        Number.isFinite(scheduled) && scheduled > now
-          ? scheduled
-          : computeNextRun(new Date(now), config.time, config.timeZone).getTime();
-      nextRun = { at: new Date(next).toISOString(), local: formatLocal(next, config.timeZone) };
+      if (armed !== null) nextRun = { at: new Date(armed).toISOString(), local: formatLocal(armed, config.timeZone) };
       localNow = formatLocal(now, config.timeZone);
     }
     const lastRaw = this.kvGet("last_run");

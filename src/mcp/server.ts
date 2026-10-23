@@ -197,7 +197,9 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
             ? `The nightly lock is off because of a configuration problem: ${status.configError}.`
             : "The nightly lock is turned off.";
         } else {
-          summary = `The nightly lock is on for ${status.time} ${status.timeZone}. Next run ${status.nextRun?.local ?? "not scheduled"}.`;
+          summary = status.nextRun
+            ? `The nightly lock is on for ${status.time} ${status.timeZone}. Next run ${status.nextRun.local}.`
+            : `The nightly lock is on for ${status.time} ${status.timeZone}, but no alarm is armed yet. The cron trigger arms it within 15 minutes.`;
           if (status.lastRun) {
             summary += ` Last run on ${status.lastRun.localDate}: ${status.lastRun.outcome === "ok" ? "succeeded" : "failed"} (${status.lastRun.detail}).`;
           }

@@ -271,6 +271,84 @@ describe("nightly lock alarm", () => {
     expect(await alarmAt(stub)).toBe(NEXT_DAY);
   });
 
+  it("confirms an acknowledged-only reply from the car's lock state before calling it done", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.behaviors = [{ kind: "ack" }];
+    const stub = await setup(tesla);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.commands).toBe(1);
+    expect(tesla.fleetRequests.some((request) => request.path.endsWith("/vehicle_data"))).toBe(true);
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ localDate: "2030-06-15", outcome: "ok" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+  });
+
+  it("checks the lock state before resending when it resumes an interrupted run", async () => {
+    const tesla = new FakeTesla();
+    const stub = await setup(tesla);
+    // The interrupted run locked the car but never recorded the outcome.
+    tesla.car.locked = true;
+    await runInDurableObject(stub, (_instance: OwnerState, state) => {
+      state.storage.sql.exec(
+        "INSERT INTO kv (key, value) VALUES ('nightly_run', ?)",
+        JSON.stringify({
+          localDate: "2030-06-15",
+          status: "pending",
+          attempts: 1,
+          startedAt: new Date(RUN_AT).toISOString(),
+        }),
+      );
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.commands).toBe(0);
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ outcome: "ok", detail: "already_locked" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+  });
+
+  it("after an outage, runs tonight's lock instead of skipping to tomorrow", async () => {
+    const tesla = new FakeTesla();
+    const stub = await setup(tesla);
+    // Yesterday's alarm is only delivered tonight at 22:30.
+    await runInDurableObject(stub, (instance: OwnerState) => {
+      instance.clock = () => NEXT_DAY + 30 * 60_000;
+    });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.commands).toBe(0);
+    expect((await stub.auditRecent(1))[0]).toMatchObject({ action: "nightly_lock", detail: "missed" });
+    // Tonight's run is armed (already due) rather than tomorrow's.
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.locked).toBe(true);
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ localDate: "2030-06-16", outcome: "ok" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY + 86_400_000);
+  });
+
+  it("does not lock right away when first deployed after tonight's lock time", async () => {
+    const tesla = new FakeTesla();
+    tesla.install();
+    const stub = env.OWNER.get(env.OWNER.idFromName(uniqueName("late-deploy")));
+    await runInDurableObject(stub, (instance: OwnerState) => {
+      instance.clock = () => RUN_AT + 30 * 60_000;
+    });
+    expect(await stub.ensureAlarm()).toEqual({ nextRun: new Date(NEXT_DAY).toISOString() });
+    expect(tesla.requests).toHaveLength(0);
+  });
+
+  it("reports the armed alarm, not a computed time, in the status", async () => {
+    const tesla = new FakeTesla();
+    tesla.install();
+    const stub = env.OWNER.get(env.OWNER.idFromName(uniqueName("status")));
+    await runInDurableObject(stub, (instance: OwnerState) => {
+      instance.clock = () => BEFORE;
+    });
+    // Freshly deployed: nothing is armed until the cron calls ensureAlarm.
+    expect((await stub.nightlyLockStatus()).nextRun).toBeNull();
+    await stub.ensureAlarm();
+    expect((await stub.nightlyLockStatus()).nextRun).toEqual({
+      at: new Date(RUN_AT).toISOString(),
+      local: "2030-06-15 22:00 America/New_York",
+    });
+  });
+
   it("respects NIGHTLY_LOCK_ENABLED", async () => {
     const tesla = new FakeTesla();
     tesla.install();

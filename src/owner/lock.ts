@@ -11,6 +11,9 @@ export type LockDeps = {
   /** vehicle_state.locked when the car is online; null when unavailable. */
   isLocked(): Promise<boolean | null>;
   sleep(milliseconds: number): Promise<void>;
+  /** Wall clock in milliseconds; bounds the whole flow, including the time
+   * Tesla takes to answer, not just the sleeps between calls. */
+  now(): number;
 };
 
 export type LockPolicy = {
@@ -18,11 +21,23 @@ export type LockPolicy = {
   maxAttempts: number;
   /** How long to poll for "online" after each wake_up. */
   wakeTimeoutMs: number;
+  /** No new wake, poll, or lock attempt starts after this much wall-clock
+   * time. A call already in flight can still finish after it. */
+  budgetMs: number;
 };
 
-export const NIGHTLY_LOCK_POLICY: LockPolicy = { maxAttempts: 4, wakeTimeoutMs: 90_000 };
+// A Durable Object alarm handler is cut off after 15 minutes of wall time.
+// Nine minutes leaves room for one more signed command already in flight
+// (handshake and command retries can take a few minutes when Tesla is slow).
+export const NIGHTLY_LOCK_POLICY: LockPolicy = { maxAttempts: 4, wakeTimeoutMs: 90_000, budgetMs: 9 * 60_000 };
 // MCP clients time out long tool calls; keep an interactive lock shorter.
-export const INTERACTIVE_LOCK_POLICY: LockPolicy = { maxAttempts: 2, wakeTimeoutMs: 45_000 };
+export const INTERACTIVE_LOCK_POLICY: LockPolicy = { maxAttempts: 2, wakeTimeoutMs: 45_000, budgetMs: 2 * 60_000 };
+
+export type LockOptions = {
+  /** Check vehicle_state.locked before sending: a resumed run may already
+   * have locked the car before it was interrupted. */
+  checkLockedFirst?: boolean;
+};
 
 export type LockOutcome =
   | {
@@ -51,13 +66,20 @@ const RETRY_DELAY_MS = 3_000;
 // resending (bounded: about 14 seconds in total).
 const STATUS_POLL_DELAYS = [2_000, 4_000, 8_000];
 
-async function wakeAndWait(deps: LockDeps, timeoutMs: number): Promise<boolean> {
+async function wakeAndWait(deps: LockDeps, timeoutMs: number, deadline: number): Promise<boolean> {
+  const start = deps.now();
   await deps.wake();
-  let waited = 0;
-  for (let poll = 0; waited < timeoutMs; poll++) {
-    const delay = Math.min(WAKE_POLL_DELAYS[Math.min(poll, WAKE_POLL_DELAYS.length - 1)] as number, timeoutMs - waited);
+  // Count both the sleeps and the clock, so slow polls end the wait too.
+  let slept = 0;
+  const elapsed = () => Math.max(slept, deps.now() - start);
+  for (let poll = 0; elapsed() < timeoutMs && deps.now() < deadline; poll++) {
+    const delay = Math.min(
+      WAKE_POLL_DELAYS[Math.min(poll, WAKE_POLL_DELAYS.length - 1)] as number,
+      timeoutMs - elapsed(),
+      Math.max(0, deadline - deps.now()),
+    );
     await deps.sleep(delay);
-    waited += delay;
+    slept += delay;
     if ((await deps.getState()) === "online") return true;
   }
   return false;
@@ -74,20 +96,33 @@ async function pollLocked(deps: LockDeps): Promise<boolean | null> {
   return locked;
 }
 
-export async function lockWithRetry(deps: LockDeps, policy: LockPolicy): Promise<LockOutcome> {
+export async function lockWithRetry(
+  deps: LockDeps,
+  policy: LockPolicy,
+  options: LockOptions = {},
+): Promise<LockOutcome> {
+  const deadline = deps.now() + policy.budgetMs;
   let woke = false;
+  let online = true;
   let lastCode: VcpErrorCode | "wake_timeout" = "vehicle_unavailable";
   let lastDetail = "not_attempted";
 
   if ((await deps.getState()) !== "online") {
     woke = true;
-    if (!(await wakeAndWait(deps, policy.wakeTimeoutMs))) {
+    online = await wakeAndWait(deps, policy.wakeTimeoutMs, deadline);
+    if (!online) {
       lastCode = "wake_timeout";
       lastDetail = "vehicle did not come online after wake";
     }
   }
+  if (options.checkLockedFirst && online && (await deps.isLocked()) === true) {
+    return { ok: true, detail: "already_locked", attempts: 0, woke };
+  }
 
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
+    if (attempt > 1 && deps.now() >= deadline) {
+      return { ok: false, code: lastCode, detail: `${lastDetail} time_budget_exhausted`, attempts: attempt - 1, woke };
+    }
     const result = await deps.sendLock();
     if (result.ok) {
       return { ok: true, detail: woke ? "locked_after_wake" : "locked", attempts: attempt, woke };
@@ -117,7 +152,7 @@ export async function lockWithRetry(deps: LockDeps, policy: LockPolicy): Promise
 
     if (code === "vehicle_unavailable") {
       woke = true;
-      if (!(await wakeAndWait(deps, policy.wakeTimeoutMs))) {
+      if (!(await wakeAndWait(deps, policy.wakeTimeoutMs, deadline))) {
         lastCode = "wake_timeout";
         lastDetail = "vehicle did not come online after wake";
       }

@@ -102,12 +102,28 @@ export function validTimeZone(value: string): boolean {
 /** The next instant strictly after `now` whose local time in `timeZone` is
  * `hhmm` ("HH:MM", 24-hour). Throws on invalid input. */
 export function computeNextRun(now: Date, hhmm: string, timeZone: string): Date {
+  return findRun(now, hhmm, timeZone, [0, 1, 2], (candidate, nowMs) => candidate > nowMs);
+}
+
+/** The latest instant at or before `now` whose local time in `timeZone` is
+ * `hhmm`. Throws on invalid input. */
+export function computeLatestRun(now: Date, hhmm: string, timeZone: string): Date {
+  return findRun(now, hhmm, timeZone, [0, -1, -2], (candidate, nowMs) => candidate <= nowMs);
+}
+
+function findRun(
+  now: Date,
+  hhmm: string,
+  timeZone: string,
+  dayOffsets: number[],
+  accept: (candidate: number, nowMs: number) => boolean,
+): Date {
   const time = parseLocalTime(hhmm);
   if (!time) throw new RangeError("invalid local time");
   if (!validTimeZone(timeZone)) throw new RangeError("invalid time zone");
   const nowMs = now.getTime();
   const today = localParts(nowMs, timeZone);
-  for (let offset = 0; offset <= 2; offset++) {
+  for (const offset of dayOffsets) {
     // Date.UTC normalizes day overflow across month and year boundaries.
     const date = new Date(Date.UTC(today.year, today.month - 1, today.day + offset));
     const candidate = localToInstant(
@@ -118,7 +134,7 @@ export function computeNextRun(now: Date, hhmm: string, timeZone: string): Date 
       time.minute,
       timeZone,
     );
-    if (candidate > nowMs) return new Date(candidate);
+    if (accept(candidate, nowMs)) return new Date(candidate);
   }
-  throw new Error("no next run found");
+  throw new Error("no run found");
 }
