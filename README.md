@@ -43,8 +43,11 @@ OAuth is planned; the auth and storage seams are already in place for it.
 At `NIGHTLY_LOCK_TIME` in `NIGHTLY_LOCK_TIMEZONE` (default 22:00 America/New_York, correct across daylight saving
 changes), a Durable Object alarm sends the signed lock. If the car is asleep or offline it is woken, polled until
 online (up to about 90 seconds), and the lock is retried, up to 4 attempts in total. An already locked car counts as
-success. Each night runs at most once, and every run is audited. A cron trigger every 15 minutes keeps the alarm
-armed; it does nothing else.
+success. Failures Tesla marks as not retryable stop at once, and if a lock response is lost the car's lock state is
+checked instead of sending the lock again. A night that finished never runs again. A run interrupted part way (for
+example, the Durable Object was restarted) is resumed up to 3 times, within 3 hours of the scheduled time. After that
+it is audited as missed or abandoned. Every run is audited. A cron trigger every 15 minutes keeps the alarm armed; it
+does nothing else.
 
 ## Self-hosting
 
