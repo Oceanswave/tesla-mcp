@@ -72,6 +72,35 @@ describe("OwnerState Tesla tokens", () => {
     });
   });
 
+  it("seeds exactly once when cold-start callers race, and never restores the bootstrap token", async () => {
+    const tesla = new FakeTesla();
+    tesla.install();
+    const stub = ownerStub();
+    await runInDurableObject(stub, async (instance: OwnerState, state) => {
+      const tokens = await Promise.all([
+        instance.getAccessToken(),
+        instance.getAccessToken(true),
+        instance.getAccessToken(),
+        instance.getAccessToken(true),
+        instance.getAccessToken(),
+      ]);
+      expect(new Set(tokens)).toEqual(new Set([tesla.issuedAccessTokens[0]]));
+      expect(tesla.tokenRequests).toHaveLength(1);
+      // Let any stray continuation finish before inspecting storage.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      const seeded = state.storage.sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM audit WHERE action = 'tokens_seeded'")
+        .one().n;
+      expect(seeded).toBe(1);
+      const stored = await decryptTokens(await importTokenKey(env.TOKEN_ENCRYPTION_KEY), storedBlob(state) as string);
+      expect(stored.refreshToken).toBe(tesla.issuedRefreshTokens[0]);
+      expect(stored.accessToken).toBe(tesla.issuedAccessTokens[0]);
+      // A forced refresh after the fact still uses the rotated token.
+      await instance.getAccessToken(true);
+      expect(tesla.tokenRequests[1]?.get("refresh_token")).toBe(tesla.issuedRefreshTokens[0]);
+    });
+  });
+
   it("stops at reauth_required on invalid_grant without retrying", async () => {
     const tesla = new FakeTesla();
     tesla.tokenResponder = () =>

@@ -94,8 +94,8 @@ export class OwnerState extends DurableObject<Env> {
     new Promise((resolve) => setTimeout(resolve, milliseconds));
   fetchFn: FetchFn = defaultFetch;
 
-  private refreshing: Promise<string> | null = null;
-  private tokenGeneration = 0;
+  private tokenFlight: Promise<string> | null = null;
+  private refreshCount = 0;
   private lane: Promise<unknown> = Promise.resolve();
   private vehicleCache: { at: number; vehicles: VehicleSummary[] } | null = null;
 
@@ -190,14 +190,10 @@ export class OwnerState extends DurableObject<Env> {
     }
   }
 
-  private async saveTokens(tokens: StoredTokens): Promise<void> {
-    this.kvSet("tokens", await encryptTokens(await this.tokenKey(), tokens));
-    this.tokenGeneration++;
-  }
-
   /** Load stored tokens, seeding from TESLA_BOOTSTRAP_REFRESH_TOKEN only when
    * nothing is stored yet, or when Tesla rejected the stored refresh token and
-   * the owner has since provided a different bootstrap token. */
+   * the owner has since provided a different bootstrap token. Runs only inside
+   * the token flight (see getAccessToken). */
   private async loadTokens(): Promise<StoredTokens> {
     const key = await this.tokenKey();
     const blob = this.kvGet("tokens");
@@ -206,7 +202,18 @@ export class OwnerState extends DurableObject<Env> {
     if (bootstrap && (!blob || reauth)) {
       const seed = await fingerprint(bootstrap);
       if (this.kvGet("seed_fingerprint") !== seed) {
-        await this.saveTokens({ accessToken: null, refreshToken: bootstrap, expiresAt: 0 });
+        const seeded: StoredTokens = { accessToken: null, refreshToken: bootstrap, expiresAt: 0 };
+        const encrypted = await encryptTokens(key, seeded);
+        // Compare-and-set: write only over exactly the state read above, so a
+        // seed can never replace tokens rotated in the meantime.
+        if (
+          this.kvGet("tokens") !== blob ||
+          this.kvGet("seed_fingerprint") === seed ||
+          (this.kvGet("auth_state") === "reauth_required") !== reauth
+        ) {
+          return this.loadTokens();
+        }
+        this.kvSet("tokens", encrypted);
         this.kvSet("seed_fingerprint", seed);
         this.kvDelete("auth_state");
         this.audit({
@@ -216,7 +223,7 @@ export class OwnerState extends DurableObject<Env> {
           outcome: "ok",
           detail: reauth ? "replaced rejected refresh token" : "initial seed",
         });
-        return { accessToken: null, refreshToken: bootstrap, expiresAt: 0 };
+        return seeded;
       }
     }
     if (reauth) {
@@ -234,23 +241,31 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   /** A valid access token, refreshing when missing or expiring within five
-   * minutes. Concurrent callers share one in-flight refresh. `force` is used
-   * once after a Fleet 401 with a token that looked valid. */
+   * minutes. One in-flight promise covers load, seed, and refresh, so token
+   * storage only ever changes inside it; concurrent callers share it. `force`
+   * is used once after a Fleet 401 with a token that looked valid: a forced
+   * caller waits out the current flight and is satisfied by any refresh that
+   * completed since it asked. */
   async getAccessToken(force = false): Promise<string> {
-    if (this.refreshing) return this.refreshing;
-    const generation = this.tokenGeneration;
+    const refreshesAtCall = this.refreshCount;
+    while (this.tokenFlight) {
+      if (!force) return this.tokenFlight;
+      await this.tokenFlight.catch(() => undefined);
+      if (this.refreshCount !== refreshesAtCall) force = false;
+    }
+    const flight: Promise<string> = this.acquireToken(force).finally(() => {
+      if (this.tokenFlight === flight) this.tokenFlight = null;
+    });
+    this.tokenFlight = flight;
+    return flight;
+  }
+
+  private async acquireToken(force: boolean): Promise<string> {
     const tokens = await this.loadTokens();
-    if (this.refreshing) return this.refreshing;
-    // A refresh finished while we were loading: what we loaded may hold the
-    // rotated-away refresh token. Re-read instead of refreshing with it.
-    if (generation !== this.tokenGeneration) return this.getAccessToken(false);
     if (!force && tokens.accessToken && tokens.expiresAt - REFRESH_MARGIN_MS > this.clock()) {
       return tokens.accessToken;
     }
-    this.refreshing = this.refresh(tokens).finally(() => {
-      this.refreshing = null;
-    });
-    return this.refreshing;
+    return this.refresh(tokens);
   }
 
   private async refresh(tokens: StoredTokens): Promise<string> {
@@ -331,11 +346,13 @@ export class OwnerState extends DurableObject<Env> {
     const expiresIn = typeof body.expires_in === "number" && body.expires_in > 0 ? body.expires_in : 900;
     // Tesla rotates refresh tokens and invalidates the old one: persist the
     // new pair before anyone can use the access token.
-    await this.saveTokens({
+    const encrypted = await encryptTokens(await this.tokenKey(), {
       accessToken,
       refreshToken: rotated ?? tokens.refreshToken,
       expiresAt: this.clock() + Math.min(expiresIn, 30 * 86_400) * 1000,
     });
+    this.kvSet("tokens", encrypted);
+    this.refreshCount++;
     return accessToken;
   }
 
