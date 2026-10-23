@@ -3,12 +3,18 @@ import { type LockDeps, lockWithRetry, NIGHTLY_LOCK_POLICY } from "../src/owner/
 import type { SignedCommandResult, VcpErrorCode } from "../src/tesla/vcp/session";
 
 const ok: SignedCommandResult = { ok: true };
-const fail = (code: VcpErrorCode): SignedCommandResult => ({
+// Mirrors the session: only vehicle_unavailable (408, exhausted transient
+// faults) is reported as retryable.
+const fail = (code: VcpErrorCode, retryable = code === "vehicle_unavailable"): SignedCommandResult => ({
   ok: false,
-  error: { code, retryable: false, stage: `test_${code}` },
+  error: { code, retryable, stage: `test_${code}` },
 });
 
-function deps(options: { states: (string | null)[]; locks: SignedCommandResult[]; locked?: boolean | null }) {
+function deps(options: {
+  states: (string | null)[];
+  locks: SignedCommandResult[];
+  locked?: boolean | null | (boolean | null)[];
+}) {
   const calls = { wake: 0, lock: 0, state: 0, isLocked: 0, slept: 0 };
   const d: LockDeps = {
     getState: async () => {
@@ -24,6 +30,7 @@ function deps(options: { states: (string | null)[]; locks: SignedCommandResult[]
     },
     isLocked: async () => {
       calls.isLocked++;
+      if (Array.isArray(options.locked)) return options.locked.shift() ?? null;
       return options.locked ?? null;
     },
     sleep: async (milliseconds) => {
@@ -76,6 +83,47 @@ describe("lockWithRetry", () => {
     // One wake before the first attempt and one between each attempt.
     expect(calls.wake).toBe(4);
     expect(calls.slept).toBe(4 * NIGHTLY_LOCK_POLICY.wakeTimeoutMs);
+  });
+
+  it("stops when the session reports a failure as not retryable", async () => {
+    for (const code of ["session_unavailable", "service_unavailable", "command_rejected"] as const) {
+      const { d, calls } = deps({ states: ["online"], locks: [fail(code, false), ok], locked: false });
+      expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY)).toMatchObject({ ok: false, code, attempts: 1 });
+      expect(calls.lock).toBe(1);
+    }
+  });
+
+  it("retries a retryable failure that is not vehicle_unavailable", async () => {
+    const { d, calls } = deps({ states: ["online"], locks: [fail("session_unavailable", true), ok] });
+    expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY)).toMatchObject({ ok: true, detail: "locked", attempts: 2 });
+    expect(calls.lock).toBe(2);
+    expect(calls.wake).toBe(0);
+  });
+
+  it("never resends after an unknown outcome while the lock state stays unknown", async () => {
+    const { d, calls } = deps({ states: ["online"], locks: [fail("status_unknown"), ok], locked: null });
+    expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY)).toMatchObject({
+      ok: false,
+      code: "status_unknown",
+      attempts: 1,
+    });
+    expect(calls.lock).toBe(1);
+    // The first check plus three bounded re-polls.
+    expect(calls.isLocked).toBe(4);
+    expect(calls.slept).toBe(2_000 + 4_000 + 8_000);
+  });
+
+  it("counts an unknown outcome as success once a later poll shows the car locked", async () => {
+    const { d, calls } = deps({ states: ["online"], locks: [fail("status_unknown")], locked: [null, null, true] });
+    expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY)).toMatchObject({ ok: true, detail: "locked", attempts: 1 });
+    expect(calls.lock).toBe(1);
+    expect(calls.isLocked).toBe(3);
+  });
+
+  it("resends after an unknown outcome only when the car reports itself unlocked", async () => {
+    const { d, calls } = deps({ states: ["online"], locks: [fail("status_unknown"), ok], locked: [false] });
+    expect(await lockWithRetry(d, NIGHTLY_LOCK_POLICY)).toMatchObject({ ok: true, detail: "locked", attempts: 2 });
+    expect(calls.lock).toBe(2);
   });
 
   it("does not retry faults a retry cannot fix", async () => {
