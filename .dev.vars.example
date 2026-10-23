@@ -1,0 +1,29 @@
+# Local development secrets for `wrangler dev`. Copy to .dev.vars (gitignored)
+# and fill in. In production set each with `wrangler secret put NAME`.
+# Every value below is a placeholder.
+
+# Static bearer token MCP clients send as "Authorization: Bearer <token>".
+# Generate: openssl rand -base64 32
+MCP_BEARER_TOKEN=replace-with-a-long-random-string
+
+# Tesla developer application credentials (developer.tesla.com).
+TESLA_CLIENT_ID=replace-with-your-client-id
+TESLA_CLIENT_SECRET=replace-with-your-client-secret
+
+# The vehicle-command private key: base64 of the PKCS#8 DER encoding of your
+# P-256 key. It must match TESLA_PUBLIC_KEY_PEM in wrangler.jsonc.
+# Convert without writing a file:
+#   openssl pkcs8 -topk8 -nocrypt -in private-key.pem -outform DER | base64 | tr -d '\n'
+TESLA_COMMAND_PRIVATE_KEY_PKCS8_B64=replace-with-base64-pkcs8-der
+
+# AES-256-GCM key for Tesla tokens at rest: base64 of 32 random bytes.
+# Generate: openssl rand -base64 32
+TOKEN_ENCRYPTION_KEY=replace-with-base64-32-bytes
+
+# Optional one-time seed: a Tesla refresh token for your account. Used only
+# when no tokens are stored yet (or after Tesla rejected the stored one).
+TESLA_BOOTSTRAP_REFRESH_TOKEN=replace-with-a-refresh-token
+
+# Optional: the Fleet vehicle id to target. If unset and the account has one
+# vehicle, that vehicle is used; otherwise tools need vehicle_id.
+TESLA_VEHICLE_ID=
