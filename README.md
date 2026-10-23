@@ -45,7 +45,7 @@ changes), a Durable Object alarm sends the signed lock. If the car is asleep or 
 online (up to about 90 seconds), and the lock is retried, up to 4 attempts in total. An already locked car counts as
 success. Failures Tesla marks as not retryable stop at once. If a lock response is lost, or the car only
 acknowledges the command without confirming it ran, the car's lock state is checked instead of sending the lock
-again. The whole run stops starting new attempts after 9 minutes, well inside the 15-minute limit Cloudflare gives an
+again. The whole run stops starting new attempts after 7 minutes, well inside the 15-minute limit Cloudflare gives an
 alarm. A night that finished never runs again. A run interrupted part way (for example, the Durable Object was
 restarted) is resumed up to 3 times, within 3 hours of the scheduled time, and a resumed run checks whether the car
 is already locked before sending anything. After that it is audited as missed or abandoned. If an outage delays the

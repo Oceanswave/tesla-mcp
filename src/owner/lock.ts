@@ -27,9 +27,10 @@ export type LockPolicy = {
 };
 
 // A Durable Object alarm handler is cut off after 15 minutes of wall time.
-// Nine minutes leaves room for one more signed command already in flight
-// (handshake and command retries can take a few minutes when Tesla is slow).
-export const NIGHTLY_LOCK_POLICY: LockPolicy = { maxAttempts: 4, wakeTimeoutMs: 90_000, budgetMs: 9 * 60_000 };
+// Seven minutes leaves room for one more signed command already in flight
+// (handshake and command retries can take about five minutes when every
+// Tesla call times out) plus the lock-state check after it.
+export const NIGHTLY_LOCK_POLICY: LockPolicy = { maxAttempts: 4, wakeTimeoutMs: 90_000, budgetMs: 7 * 60_000 };
 // MCP clients time out long tool calls; keep an interactive lock shorter.
 export const INTERACTIVE_LOCK_POLICY: LockPolicy = { maxAttempts: 2, wakeTimeoutMs: 45_000, budgetMs: 2 * 60_000 };
 
@@ -119,6 +120,7 @@ export async function lockWithRetry(
     return { ok: true, detail: "already_locked", attempts: 0, woke };
   }
 
+  // The first attempt always runs; later ones only start within the budget.
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
     if (attempt > 1 && deps.now() >= deadline) {
       return { ok: false, code: lastCode, detail: `${lastDetail} time_budget_exhausted`, attempts: attempt - 1, woke };
@@ -149,6 +151,9 @@ export async function lockWithRetry(
       if (!result.error.retryable) return { ok: false, code, detail: stage, attempts: attempt, woke };
     }
     if (attempt === policy.maxAttempts) break;
+    if (deps.now() >= deadline) {
+      return { ok: false, code: lastCode, detail: `${lastDetail} time_budget_exhausted`, attempts: attempt, woke };
+    }
 
     if (code === "vehicle_unavailable") {
       woke = true;

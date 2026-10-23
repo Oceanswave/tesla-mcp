@@ -355,7 +355,16 @@ export class TeslaVcpCore {
       // Only VCSEC commands exist today; an infotainment command would decode
       // a CarServer.Response here instead.
       const result = parseVcsecResult(responsePayload);
-      if (result.status === "ok") return;
+      if (result.status === "ok") {
+        // A plaintext completion without a request UUID is matched only by a
+        // routing address this client reuses, so it could be a stale reply.
+        // An encrypted one is bound to this request by its AES-GCM request
+        // hash. Otherwise the caller checks the car before calling it done.
+        if (!response.requestUuid?.byteLength && !response.hasResponseEncryptionData) {
+          throw new VcpError("status_unknown", false, "vcsec_uncorrelated_completion");
+        }
+        return;
+      }
       if (result.status === "acknowledged") {
         // Received but not confirmed as executed; the caller checks the car.
         throw new VcpError("status_unknown", false, "vcsec_acknowledged");
@@ -430,11 +439,14 @@ export class TeslaVcpCore {
   /** Is this reply for the request with `uuid`? A request UUID, when present,
    * must match. VCSEC may omit it: Tesla's dispatcher (internal/dispatcher,
    * process) matches VCSEC replies by routing address alone, so a VCSEC reply
-   * without one must be addressed to this client's routing address. */
+   * without one must come from VCSEC and be addressed to this client's
+   * routing address. Callers never treat such a plaintext reply alone as
+   * proof that a command ran. */
   private correlated(response: RoutableResponse, uuid: Uint8Array, domain: VcpDomain): boolean {
     if (response.requestUuid?.byteLength) return constantTimeEqual(response.requestUuid, uuid);
     return (
       domain === DOMAIN_VEHICLE_SECURITY &&
+      response.fromDomain === DOMAIN_VEHICLE_SECURITY &&
       response.toRoutingAddress !== null &&
       constantTimeEqual(response.toRoutingAddress, this.routingAddress)
     );

@@ -58,13 +58,16 @@ describe("VCSEC session against a simulated vehicle", () => {
     expect(tesla.car.locked).toBe(true);
   });
 
-  it("accepts a VCSEC reply without a request UUID when it is addressed to this client", async () => {
+  it("accepts a VCSEC reply without a request UUID but asks the caller to confirm it", async () => {
     const tesla = new FakeTesla();
     tesla.car.behaviors = [{ kind: "ok_no_uuid" }];
-    expect(await codeOf(coreFor(tesla).command({ vin: tesla.vin, accessToken: TOKEN, command: "door_lock" }))).toBe(
-      "ok",
-    );
+    const core = coreFor(tesla);
+    await expect(core.command({ vin: tesla.vin, accessToken: TOKEN, command: "door_lock" })).rejects.toMatchObject({
+      code: "status_unknown",
+      stage: "vcsec_uncorrelated_completion",
+    });
     expect(tesla.car.locked).toBe(true);
+    expect(tesla.car.commands).toBe(1);
   });
 
   it("treats a reply without a request UUID for another address as unknown, never success", async () => {
