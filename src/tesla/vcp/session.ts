@@ -21,6 +21,7 @@ import {
 import {
   buildSessionInfoRequest,
   buildSignedCommand,
+  DOMAIN_VEHICLE_SECURITY,
   encodeCommandMetadata,
   encodeResponseMetadata,
   encodeSessionInfoMetadata,
@@ -30,6 +31,7 @@ import {
   parseRoutableResponse,
   parseSessionInfo,
   parseVcsecResult,
+  type RoutableResponse,
   responseRequestHash,
   SIGNED_COMMANDS,
   type SignedCommandName,
@@ -303,7 +305,7 @@ export class TeslaVcpCore {
     } catch {
       throw new VcpError("status_unknown", false, "command_response_decode");
     }
-    if (!response.requestUuid || !constantTimeEqual(response.requestUuid, uuid)) {
+    if (!this.correlated(response, uuid, domain)) {
       throw new VcpError("status_unknown", false, "command_response_correlation");
     }
 
@@ -354,6 +356,10 @@ export class TeslaVcpCore {
       // a CarServer.Response here instead.
       const result = parseVcsecResult(responsePayload);
       if (result.status === "ok") return;
+      if (result.status === "acknowledged") {
+        // Received but not confirmed as executed; the caller checks the car.
+        throw new VcpError("status_unknown", false, "vcsec_acknowledged");
+      }
       if (result.status === "wait") {
         return this.retryUnexecuted(accessToken, command, sessionRetryUsed, attempt, "vcsec_wait");
       }
@@ -421,6 +427,19 @@ export class TeslaVcpCore {
     return this.sendSigned(accessToken, command, sessionRetryUsed, attempt + 1);
   }
 
+  /** Is this reply for the request with `uuid`? A request UUID, when present,
+   * must match. VCSEC may omit it: Tesla's dispatcher (internal/dispatcher,
+   * process) matches VCSEC replies by routing address alone, so a VCSEC reply
+   * without one must be addressed to this client's routing address. */
+  private correlated(response: RoutableResponse, uuid: Uint8Array, domain: VcpDomain): boolean {
+    if (response.requestUuid?.byteLength) return constantTimeEqual(response.requestUuid, uuid);
+    return (
+      domain === DOMAIN_VEHICLE_SECURITY &&
+      response.toRoutingAddress !== null &&
+      constantTimeEqual(response.toRoutingAddress, this.routingAddress)
+    );
+  }
+
   private async getSession(vin: string, accessToken: string, domain: VcpDomain): Promise<Session> {
     const cached = this.sessions.get(domain);
     if (cached && this.now() - cached.createdAtMs <= SESSION_TTL_MS) return cached;
@@ -435,7 +454,7 @@ export class TeslaVcpCore {
       const request = buildSessionInfoRequest(key.publicKey, this.routingAddress, uuid, domain);
       try {
         const response = parseRoutableResponse(await this.postSignedCommand(vin, accessToken, request));
-        if (!response.requestUuid || !constantTimeEqual(response.requestUuid, uuid)) {
+        if (!this.correlated(response, uuid, domain)) {
           throw new VcpError("session_unavailable", true, "handshake_correlation");
         }
         if (KEY_FAULTS.has(response.fault)) {

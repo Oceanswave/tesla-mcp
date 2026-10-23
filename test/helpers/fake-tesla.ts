@@ -43,7 +43,15 @@ export type CarBehavior =
   | { kind: "fault"; fault: number }
   | { kind: "wait" }
   /** Lock, then answer with an AES-GCM encrypted FromVCSECMessage. */
-  | { kind: "encrypted_ok" };
+  | { kind: "encrypted_ok" }
+  /** Lock, but answer only with CommandStatus(OK), an acknowledgement that
+   * Tesla's RKE handler does not treat as completion. */
+  | { kind: "ack" }
+  /** Lock, then answer as Tesla's VCSEC may: without a request UUID, matched
+   * by routing address only. */
+  | { kind: "ok_no_uuid" }
+  /** Answer with no request UUID, addressed to another client. */
+  | { kind: "misaddressed" };
 
 /** Tesla's metadata TLV (tag, length, value). Built independently of the
  * signer's encoder so the fake checks the protocol, not itself. */
@@ -73,6 +81,7 @@ export class FakeCar {
   private keyPair: CryptoKeyPair | null = null;
   private publicKey: Uint8Array | null = null;
   private sessionKey: Uint8Array | null = null;
+  private lastRoutingAddress: Uint8Array = new Uint8Array(16);
 
   constructor(readonly vin: string) {}
 
@@ -91,9 +100,12 @@ export class FakeCar {
     const fields = parseFields(message);
     const uuid = bytesField(fields, 51);
     const to = bytesField(fields, 6);
-    if (!uuid || !to || numberField(parseFields(to), 1) !== DOMAIN_VEHICLE_SECURITY) {
+    const from = bytesField(fields, 7);
+    const routingAddress = from ? bytesField(parseFields(from), 2) : null;
+    if (!uuid || !to || !routingAddress || numberField(parseFields(to), 1) !== DOMAIN_VEHICLE_SECURITY) {
       throw new Error("fake car: bad envelope");
     }
+    this.lastRoutingAddress = routingAddress;
     const sessionRequest = bytesField(fields, 14);
     if (sessionRequest) return this.handshake(uuid, bytesField(parseFields(sessionRequest), 1));
     return this.command(fields, uuid);
@@ -204,9 +216,21 @@ export class FakeCar {
     // UnsignedMessage { RKEAction = LOCK } is exactly 0x10 0x01.
     if (payload.byteLength === 2 && payload[0] === 0x10 && payload[1] === 0x01) this.locked = true;
     if (behavior.kind === "encrypted_ok") return this.encryptedReply(uuid, tag);
-    // FromVCSECMessage { commandStatus { operationStatus OK } } (OK is the
-    // proto3 default, so the CommandStatus is empty).
-    return reply(encodeLengthDelimited(10, encodeLengthDelimited(4, new Uint8Array())));
+    if (behavior.kind === "ack") {
+      // FromVCSECMessage { commandStatus { operationStatus OK } } (OK is the
+      // proto3 default, so the CommandStatus is empty).
+      return reply(encodeLengthDelimited(10, encodeLengthDelimited(4, new Uint8Array())));
+    }
+    // Completion: an empty FromVCSECMessage, so no payload at all, addressed
+    // to the client's routing address as the vehicle does.
+    const toClient = (address: Uint8Array) =>
+      concatBytes(
+        encodeLengthDelimited(6, encodeLengthDelimited(2, address)),
+        encodeLengthDelimited(7, encodeVarintField(1, DOMAIN_VEHICLE_SECURITY)),
+      );
+    if (behavior.kind === "ok_no_uuid") return toClient(this.lastRoutingAddress);
+    if (behavior.kind === "misaddressed") return toClient(crypto.getRandomValues(new Uint8Array(16)));
+    return reply(toClient(this.lastRoutingAddress));
   }
 
   /** Encrypt the OK reply as the vehicle does: AAD is the SHA-256 of the
@@ -233,7 +257,7 @@ export class FakeCar {
       await crypto.subtle.encrypt(
         { name: "AES-GCM", iv: nonce, additionalData, tagLength: 128 },
         key,
-        asArrayBuffer(encodeLengthDelimited(4, new Uint8Array())),
+        asArrayBuffer(new Uint8Array()),
       ),
     );
     const responseData = concatBytes(

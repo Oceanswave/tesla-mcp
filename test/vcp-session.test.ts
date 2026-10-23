@@ -58,6 +58,33 @@ describe("VCSEC session against a simulated vehicle", () => {
     expect(tesla.car.locked).toBe(true);
   });
 
+  it("accepts a VCSEC reply without a request UUID when it is addressed to this client", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.behaviors = [{ kind: "ok_no_uuid" }];
+    expect(await codeOf(coreFor(tesla).command({ vin: tesla.vin, accessToken: TOKEN, command: "door_lock" }))).toBe(
+      "ok",
+    );
+    expect(tesla.car.locked).toBe(true);
+  });
+
+  it("treats a reply without a request UUID for another address as unknown, never success", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.behaviors = [{ kind: "misaddressed" }];
+    expect(await codeOf(coreFor(tesla).command({ vin: tesla.vin, accessToken: TOKEN, command: "door_lock" }))).toBe(
+      "status_unknown",
+    );
+    expect(tesla.car.commands).toBe(1);
+  });
+
+  it("reports an acknowledged-only reply as status_unknown without resending", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.behaviors = [{ kind: "ack" }];
+    expect(await codeOf(coreFor(tesla).command({ vin: tesla.vin, accessToken: TOKEN, command: "door_lock" }))).toBe(
+      "status_unknown",
+    );
+    expect(tesla.car.commands).toBe(1);
+  });
+
   it("rejects a session whose SessionInfo HMAC does not verify", async () => {
     const tesla = new FakeTesla();
     tesla.car.forgeSessionTag = true;
@@ -178,7 +205,8 @@ describe("parseVcsecResult", () => {
   const commandStatus = (inner: Uint8Array) => encodeLengthDelimited(4, inner);
   it("classifies FromVCSECMessage replies", () => {
     expect(parseVcsecResult(new Uint8Array())).toEqual({ status: "ok" });
-    expect(parseVcsecResult(commandStatus(new Uint8Array()))).toEqual({ status: "ok" });
+    // CommandStatus(OK) acknowledges receipt; Tesla's RKE handler waits for more.
+    expect(parseVcsecResult(commandStatus(new Uint8Array()))).toEqual({ status: "acknowledged" });
     expect(parseVcsecResult(commandStatus(encodeVarintField(1, 1)))).toEqual({ status: "wait" });
     expect(
       parseVcsecResult(

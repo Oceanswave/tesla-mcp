@@ -179,7 +179,9 @@ describe("VCSEC lock vectors match the Python plugin", () => {
                 encodeLengthDelimited(15, bytesFromHex(PY.session_info)),
                 encodeLengthDelimited(50, UUID_HANDSHAKE),
               )
-            : concatBytes(encodeLengthDelimited(10, bytesFromHex("2200")), encodeLengthDelimited(50, UUID_COMMAND));
+            : // Completion: an empty FromVCSECMessage (a bare CommandStatus is
+              // only an acknowledgement).
+              encodeLengthDelimited(50, UUID_COMMAND);
         return Response.json({ response: bytesToBase64(response) });
       },
     });

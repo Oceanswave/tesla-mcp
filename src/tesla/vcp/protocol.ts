@@ -158,6 +158,8 @@ export type RoutableResponse = {
   fault: number;
   flags: number;
   toDomain: number | null;
+  /** to_destination.routing_address: the client address the reply is for. */
+  toRoutingAddress: Uint8Array | null;
   fromDomain: number | null;
   sessionInfo: Uint8Array | null;
   sessionInfoTag: Uint8Array | null;
@@ -177,6 +179,12 @@ function domainField(fields: ProtoField[], number: number): number | null {
   return numberField(parseFields(destinationBytes), 1);
 }
 
+function routingAddressField(fields: ProtoField[], number: number): Uint8Array | null {
+  const destinationBytes = bytesField(fields, number);
+  if (!destinationBytes) return null;
+  return bytesField(parseFields(destinationBytes), 2);
+}
+
 export function parseRoutableResponse(data: Uint8Array): RoutableResponse {
   const fields = parseFields(data);
   const statusBytes = bytesField(fields, 12);
@@ -194,6 +202,7 @@ export function parseRoutableResponse(data: Uint8Array): RoutableResponse {
     fault: numberField(status, 2) ?? MESSAGE_FAULT.NONE,
     flags: numberField(fields, 52) ?? 0,
     toDomain: domainField(fields, 6),
+    toRoutingAddress: routingAddressField(fields, 6),
     fromDomain: domainField(fields, 7),
     sessionInfo: bytesField(fields, 15),
     // session_info_tag is HMAC_Signature_Data { bytes tag = 1 }, not the
@@ -441,6 +450,7 @@ export function isSignedCommandName(value: unknown): value is SignedCommandName 
 
 export type VcsecResult =
   | { status: "ok" }
+  | { status: "acknowledged" }
   | { status: "wait" }
   | { status: "error"; information: number; genericError: number }
   | { status: "unknown" };
@@ -465,8 +475,11 @@ export const VCSEC_INFORMATION = {
  *   NominalError { GenericError_E genericError = 1; }
  *
  * An empty reply, or one carrying only other sub-messages (vehicle status,
- * whitelist info), is success; this is how the Python plugin has treated VCSEC
- * replies in production. Anything malformed is "unknown", never success. */
+ * whitelist info), is success. A CommandStatus with OPERATIONSTATUS_OK is only
+ * "acknowledged": Tesla's RKE handler (pkg/vehicle/vcsec.go executeRKEAction)
+ * treats any CommandStatus as non-terminal and waits for a later reply, so it
+ * does not prove the command ran. Anything malformed is "unknown", never
+ * success. */
 export function parseVcsecResult(payload: Uint8Array): VcsecResult {
   if (!payload.byteLength) return { status: "ok" };
   try {
@@ -483,7 +496,7 @@ export function parseVcsecResult(payload: Uint8Array): VcsecResult {
     }
     const commandStatus = parseFields(commandStatusBytes);
     const operationStatus = numberField(commandStatus, 1) ?? OPERATION_STATUS.OK;
-    if (operationStatus === OPERATION_STATUS.OK) return { status: "ok" };
+    if (operationStatus === OPERATION_STATUS.OK) return { status: "acknowledged" };
     if (operationStatus === OPERATION_STATUS.WAIT) return { status: "wait" };
     if (operationStatus !== OPERATION_STATUS.ERROR) return { status: "unknown" };
     const signedStatus = bytesField(commandStatus, 2);
