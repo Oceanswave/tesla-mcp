@@ -127,6 +127,11 @@ Tests run in the Workers runtime against a simulated Tesla (Fleet API, OAuth, an
 ECDH handshake and verifies every signature). All test credentials are generated at runtime. The VCSEC vectors in
 `test/vcp-vectors.test.ts` come from `scripts/vcsec_vectors.py`.
 
+`bash conformance/run.sh` (needs Go) checks the shared vectors in `test/vectors/vcsec-lock.json` against Tesla's
+official Go implementation at a pinned commit of `teslamotors/vehicle-command`. It covers key derivation, the
+handshake, the signed lock, the response request hash, and AES-GCM response decryption. CI runs it as the
+`go-conformance` job.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
