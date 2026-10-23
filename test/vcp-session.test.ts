@@ -49,6 +49,15 @@ describe("VCSEC session against a simulated vehicle", () => {
     expect(tesla.requests.every((request) => request.authorization === `Bearer ${TOKEN}`)).toBe(true);
   });
 
+  it("authenticates and decrypts an AES-GCM encrypted VCSEC reply", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.behaviors = [{ kind: "encrypted_ok" }];
+    expect(await codeOf(coreFor(tesla).command({ vin: tesla.vin, accessToken: TOKEN, command: "door_lock" }))).toBe(
+      "ok",
+    );
+    expect(tesla.car.locked).toBe(true);
+  });
+
   it("rejects a session whose SessionInfo HMAC does not verify", async () => {
     const tesla = new FakeTesla();
     tesla.car.forgeSessionTag = true;

@@ -15,10 +15,13 @@ import {
 import {
   buildSessionInfoRequest,
   buildVcsecLockPayload,
+  DOMAIN_INFOTAINMENT,
   DOMAIN_VEHICLE_SECURITY,
   encodeCommandMetadata,
   encodeLengthDelimited,
+  encodeResponseMetadata,
   encodeSessionInfoMetadata,
+  responseRequestHash,
   SIGNED_COMMANDS,
 } from "../src/tesla/vcp/protocol";
 import { TeslaVcpCore } from "../src/tesla/vcp/session";
@@ -118,6 +121,37 @@ describe("VCSEC lock vectors match the Python plugin", () => {
       bytesFromHex(PY.lock_payload),
     );
     expect(bytesToHex(tag)).toBe(PY.lock_tag);
+  });
+
+  it("binds encrypted responses to Tesla's RequestID (VCSEC truncates the tag to 16 bytes)", () => {
+    const tag = bytesFromHex(PY.lock_tag);
+    expect(bytesToHex(responseRequestHash(DOMAIN_VEHICLE_SECURITY, tag))).toBe(`08${PY.lock_tag.slice(0, 32)}`);
+    expect(bytesToHex(responseRequestHash(DOMAIN_INFOTAINMENT, tag))).toBe(`08${PY.lock_tag}`);
+    expect(
+      bytesToHex(
+        encodeResponseMetadata({
+          vin: VIN,
+          domain: DOMAIN_VEHICLE_SECURITY,
+          counter: 7,
+          flags: 0,
+          requestHash: responseRequestHash(DOMAIN_VEHICLE_SECURITY, tag),
+          fault: 0,
+        }),
+      ),
+    ).toBe(
+      [
+        "000109", // SIGNATURE_TYPE_AES_GCM_RESPONSE
+        "010102", // from domain
+        `0211${bytesToHex(new TextEncoder().encode(VIN))}`, // personalization
+        "050400000007", // counter
+        "070400000000", // flags
+        `0811${"08"}${PY.lock_tag.slice(0, 32)}`, // request hash, 17 bytes
+        "090400000000", // fault
+      ].join(""),
+    );
+    expect(() =>
+      encodeResponseMetadata({ vin: VIN, domain: 2, counter: 0, flags: 0, requestHash: tag, fault: 0 }),
+    ).toThrow("invalid response metadata");
   });
 
   it("sends byte-identical handshake and signed lock through the full session core", async () => {

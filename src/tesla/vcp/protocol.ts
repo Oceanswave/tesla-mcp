@@ -320,6 +320,15 @@ export function encodeSessionInfoMetadata(vin: string, challenge: Uint8Array): U
   );
 }
 
+/** The request hash a response is bound to, per Tesla's RequestID
+ * (internal/authentication/peer.go): SIGNATURE_TYPE_HMAC_PERSONALIZED followed
+ * by the command's HMAC tag, which VCSEC truncates to 16 bytes. */
+export function responseRequestHash(requestDomain: VcpDomain, requestTag: Uint8Array): Uint8Array {
+  if (requestTag.byteLength !== 32) throw new Error("invalid request tag");
+  const tag = requestDomain === DOMAIN_VEHICLE_SECURITY ? requestTag.subarray(0, 16) : requestTag;
+  return concatBytes(new Uint8Array([8]), tag);
+}
+
 /** AES-GCM response metadata from Tesla's vehicle-command protocol. The
  * caller hashes these bytes plus TAG_END (0xff) with SHA-256 to obtain the
  * AES-GCM additional authenticated data. */
@@ -328,7 +337,7 @@ export function encodeResponseMetadata(input: {
   domain: number;
   counter: number;
   flags: number;
-  requestTag: Uint8Array;
+  requestHash: Uint8Array;
   fault: number;
 }): Uint8Array {
   if (
@@ -336,7 +345,8 @@ export function encodeResponseMetadata(input: {
     !Number.isInteger(input.domain) ||
     input.domain < 0 ||
     input.domain > 255 ||
-    input.requestTag.byteLength !== 32
+    (input.requestHash.byteLength !== 17 && input.requestHash.byteLength !== 33) ||
+    input.requestHash[0] !== 8
   ) {
     throw new Error("invalid response metadata");
   }
@@ -347,7 +357,7 @@ export function encodeResponseMetadata(input: {
     encodeTlv(5, uint32BigEndian(input.counter)),
     // Response flags are always included, including zero.
     encodeTlv(7, uint32BigEndian(input.flags)),
-    encodeTlv(8, concatBytes(new Uint8Array([8]), input.requestTag)),
+    encodeTlv(8, input.requestHash),
     encodeTlv(9, uint32BigEndian(input.fault)),
   );
 }

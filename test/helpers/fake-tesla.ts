@@ -41,7 +41,21 @@ export type CarBehavior =
   | { kind: "http"; status: number }
   | { kind: "vcsec_error"; information: number }
   | { kind: "fault"; fault: number }
-  | { kind: "wait" };
+  | { kind: "wait" }
+  /** Lock, then answer with an AES-GCM encrypted FromVCSECMessage. */
+  | { kind: "encrypted_ok" };
+
+/** Tesla's metadata TLV (tag, length, value). Built independently of the
+ * signer's encoder so the fake checks the protocol, not itself. */
+function tlv(tag: number, value: Uint8Array): Uint8Array {
+  return concatBytes(new Uint8Array([tag, value.byteLength]), value);
+}
+
+function u32(value: number): Uint8Array {
+  const bytes = new Uint8Array(4);
+  new DataView(bytes.buffer).setUint32(0, value, false);
+  return bytes;
+}
 
 export class FakeCar {
   readonly epoch = crypto.getRandomValues(new Uint8Array(16));
@@ -189,9 +203,50 @@ export class FakeCar {
     }
     // UnsignedMessage { RKEAction = LOCK } is exactly 0x10 0x01.
     if (payload.byteLength === 2 && payload[0] === 0x10 && payload[1] === 0x01) this.locked = true;
+    if (behavior.kind === "encrypted_ok") return this.encryptedReply(uuid, tag);
     // FromVCSECMessage { commandStatus { operationStatus OK } } (OK is the
     // proto3 default, so the CommandStatus is empty).
     return reply(encodeLengthDelimited(10, encodeLengthDelimited(4, new Uint8Array())));
+  }
+
+  /** Encrypt the OK reply as the vehicle does: AAD is the SHA-256 of the
+   * response metadata, whose request hash is RequestID() from Tesla's
+   * internal/authentication/peer.go (0x08 || first 16 tag bytes for VCSEC). */
+  private async encryptedReply(uuid: Uint8Array, requestTag: Uint8Array): Promise<Uint8Array> {
+    const responseCounter = 1;
+    const metadata = concatBytes(
+      tlv(0, new Uint8Array([9])),
+      tlv(1, new Uint8Array([DOMAIN_VEHICLE_SECURITY])),
+      tlv(2, new TextEncoder().encode(this.vin)),
+      tlv(5, u32(responseCounter)),
+      tlv(7, u32(0)),
+      tlv(8, concatBytes(new Uint8Array([8]), requestTag.subarray(0, 16))),
+      tlv(9, u32(0)),
+      new Uint8Array([0xff]),
+    );
+    const additionalData = await crypto.subtle.digest("SHA-256", asArrayBuffer(metadata));
+    const nonce = crypto.getRandomValues(new Uint8Array(12));
+    const key = await crypto.subtle.importKey("raw", asArrayBuffer(this.sessionKey as Uint8Array), "AES-GCM", false, [
+      "encrypt",
+    ]);
+    const sealed = new Uint8Array(
+      await crypto.subtle.encrypt(
+        { name: "AES-GCM", iv: nonce, additionalData, tagLength: 128 },
+        key,
+        asArrayBuffer(encodeLengthDelimited(4, new Uint8Array())),
+      ),
+    );
+    const responseData = concatBytes(
+      encodeLengthDelimited(1, nonce),
+      encodeVarintField(2, responseCounter),
+      encodeLengthDelimited(3, sealed.subarray(sealed.byteLength - 16)),
+    );
+    return concatBytes(
+      encodeLengthDelimited(7, encodeVarintField(1, DOMAIN_VEHICLE_SECURITY)),
+      encodeLengthDelimited(10, sealed.subarray(0, sealed.byteLength - 16)),
+      encodeLengthDelimited(13, encodeLengthDelimited(9, responseData)),
+      encodeLengthDelimited(50, uuid),
+    );
   }
 }
 
