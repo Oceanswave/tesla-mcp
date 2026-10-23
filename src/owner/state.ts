@@ -20,6 +20,15 @@ const VEHICLE_CACHE_MS = 5 * 60_000;
 /** A nightly alarm that fires this late (platform outage) is skipped rather
  * than locking the car at an unexpected hour. */
 const MISSED_WINDOW_MS = 3 * 60 * 60_000;
+/** Runs of one night's lock, including the first: an instance evicted or
+ * failing mid-run is resumed at most three times so a crash loop cannot
+ * spam the car. */
+const MAX_NIGHTLY_RUNS = 4;
+
+/** Durable record of the current night's run. "pending" is written before
+ * any Tesla call and "done" only after the outcome is recorded, so a retried
+ * alarm resumes an interrupted run and never repeats a finished one. */
+type NightlyRun = { localDate: string; status: "pending" | "done"; attempts: number; startedAt: string };
 
 export type LockSuccess = Extract<LockOutcome, { ok: true }> & { vehicleId: string };
 
@@ -98,6 +107,8 @@ export class OwnerState extends DurableObject<Env> {
   private refreshCount = 0;
   private lane: Promise<unknown> = Promise.resolve();
   private vehicleCache: { at: number; vehicles: VehicleSummary[] } | null = null;
+  /** Set while this instance runs the nightly lock; lost on eviction. */
+  private nightlyInFlight = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -513,6 +524,7 @@ export class OwnerState extends DurableObject<Env> {
     source: AuditSource,
     vehicleId: string | undefined,
     policy: LockPolicy,
+    rethrowUnexpected = false,
   ): Promise<OwnerResult<LockSuccess>> {
     let resolvedId: string | null = vehicleId ?? null;
     try {
@@ -568,7 +580,17 @@ export class OwnerState extends DurableObject<Env> {
       if (outcome.ok) return { ok: true, data: { ...outcome, vehicleId: vehicle.id } };
       return { ok: false, error: { code: "command_failed", message: lockFailureMessage(outcome) } };
     } catch (error) {
-      this.audit({ source, action: "lock", vehicleId: resolvedId, outcome: "error", detail: this.errorDetail(error) });
+      // Anything that is not a Tesla or owner error (a lost Durable Object
+      // call, a reset) interrupted the run; the nightly alarm resumes it.
+      const interrupted = rethrowUnexpected && !(error instanceof OwnerError || error instanceof FleetError);
+      this.audit({
+        source,
+        action: "lock",
+        vehicleId: resolvedId,
+        outcome: "error",
+        detail: interrupted ? "interrupted" : this.errorDetail(error),
+      });
+      if (interrupted) throw error;
       return this.failure(error);
     }
   }
@@ -590,8 +612,9 @@ export class OwnerState extends DurableObject<Env> {
 
   /** Idempotent: set the alarm to the next nightly run unless it already is.
    * Called by the cron trigger every 15 minutes and after each run. A run that
-   * is due but not yet handled is never moved: its alarm may be delivered (or
-   * retried) after a cron tick, and alarm() runs it late or audits it missed. */
+   * is due but not yet done (never started, or pending after an interruption)
+   * is never moved: its alarm may be delivered (or retried) after a cron tick,
+   * and alarm() runs or resumes it late, or audits it missed. */
   async ensureAlarm(): Promise<{ nextRun: string | null }> {
     const config = this.nightlyConfig();
     if (!config.enabled) {
@@ -604,7 +627,7 @@ export class OwnerState extends DurableObject<Env> {
     if (
       Number.isFinite(scheduled) &&
       scheduled <= now &&
-      this.kvGet("last_run_local_date") !== localDateString(scheduled, config.timeZone)
+      !this.nightlyDone(localDateString(scheduled, config.timeZone))
     ) {
       if ((await this.ctx.storage.getAlarm()) !== scheduled) await this.ctx.storage.setAlarm(scheduled);
       return { nextRun: new Date(scheduled).toISOString() };
@@ -623,6 +646,9 @@ export class OwnerState extends DurableObject<Env> {
       this.kvDelete("scheduled_for");
       return;
     }
+    // A delivery while this instance is still running tonight's lock (the
+    // cron keeps a pending run armed) must not start a second run.
+    if (this.nightlyInFlight) return;
     const now = this.clock();
     const scheduledFor = Number(this.kvGet("scheduled_for") ?? Number.NaN);
     const target = Number.isFinite(scheduledFor) ? scheduledFor : now;
@@ -632,34 +658,93 @@ export class OwnerState extends DurableObject<Env> {
       return;
     }
     const runDate = localDateString(target, config.timeZone);
-    if (this.kvGet("last_run_local_date") === runDate) {
+    const previous = this.nightlyRun();
+    if (previous?.localDate === runDate && previous.status === "done") {
       await this.ensureAlarm();
       return;
     }
-    // Claim the date before running so a duplicate or retried alarm can never
-    // lock twice for the same night.
-    this.kvSet("last_run_local_date", runDate);
-    try {
-      if (now - target > MISSED_WINDOW_MS) {
-        this.recordLastRun(runDate, "error", "skipped: alarm fired too late");
-        this.audit({ source: "alarm", action: "nightly_lock", vehicleId: null, outcome: "error", detail: "missed" });
-        return;
-      }
-      const result = await this.inLane(() => this.lockFlow("alarm", undefined, NIGHTLY_LOCK_POLICY));
-      if (result.ok) {
-        this.recordLastRun(
-          runDate,
-          "ok",
-          result.data.detail === "locked_after_wake" ? "lock command succeeded after waking" : result.data.detail,
-        );
-      } else {
-        this.recordLastRun(runDate, "error", result.error.code);
-      }
-    } catch {
-      this.recordLastRun(runDate, "error", "internal_error");
-    } finally {
+    const resumed = previous?.localDate === runDate ? previous : null;
+    const run: NightlyRun = {
+      localDate: runDate,
+      status: "pending",
+      attempts: (resumed?.attempts ?? 0) + 1,
+      startedAt: resumed?.startedAt ?? new Date(now).toISOString(),
+    };
+    if (now - target > MISSED_WINDOW_MS) {
+      this.finishNightly(
+        { ...run, attempts: resumed?.attempts ?? 0 },
+        "error",
+        resumed ? "skipped: interrupted run not finished in time" : "skipped: alarm fired too late",
+      );
+      this.audit({
+        source: "alarm",
+        action: "nightly_lock",
+        vehicleId: null,
+        outcome: "error",
+        detail: resumed ? "missed after interruption" : "missed",
+      });
       await this.ensureAlarm();
+      return;
     }
+    if (run.attempts > MAX_NIGHTLY_RUNS) {
+      this.finishNightly({ ...run, attempts: MAX_NIGHTLY_RUNS }, "error", "abandoned: run interrupted too often");
+      this.audit({
+        source: "alarm",
+        action: "nightly_lock",
+        vehicleId: null,
+        outcome: "error",
+        detail: `abandoned runs=${MAX_NIGHTLY_RUNS}`,
+      });
+      await this.ensureAlarm();
+      return;
+    }
+    // Persist the pending run before any Tesla call: if this instance is
+    // evicted or fails mid-run, Cloudflare retries the alarm (and the cron
+    // keeps it armed), and the next delivery resumes tonight's run.
+    this.kvSet("nightly_run", JSON.stringify(run));
+    if (resumed) {
+      this.audit({
+        source: "alarm",
+        action: "nightly_lock",
+        vehicleId: null,
+        outcome: "ok",
+        detail: `resumed run=${run.attempts}`,
+      });
+    }
+    let result: OwnerResult<LockSuccess>;
+    this.nightlyInFlight = true;
+    try {
+      // An unexpected error propagates and leaves the run pending.
+      result = await this.inLane(() => this.lockFlow("alarm", undefined, NIGHTLY_LOCK_POLICY, true));
+    } finally {
+      this.nightlyInFlight = false;
+    }
+    if (result.ok) {
+      this.finishNightly(
+        run,
+        "ok",
+        result.data.detail === "locked_after_wake" ? "lock command succeeded after waking" : result.data.detail,
+      );
+    } else {
+      this.finishNightly(run, "error", result.error.code);
+    }
+    await this.ensureAlarm();
+  }
+
+  private nightlyRun(): NightlyRun | null {
+    const raw = this.kvGet("nightly_run");
+    return raw ? (JSON.parse(raw) as NightlyRun) : null;
+  }
+
+  private nightlyDone(localDate: string): boolean {
+    const run = this.nightlyRun();
+    return run?.localDate === localDate && run.status === "done";
+  }
+
+  /** Record the outcome and mark the night done in one synchronous step. */
+  private finishNightly(run: NightlyRun, outcome: AuditOutcome, detail: string): void {
+    this.recordLastRun(run.localDate, outcome, detail);
+    this.kvSet("nightly_run", JSON.stringify({ ...run, status: "done" }));
   }
 
   private recordLastRun(localDate: string, outcome: AuditOutcome, detail: string): void {

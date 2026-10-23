@@ -150,6 +150,127 @@ describe("nightly lock alarm", () => {
     expect(await alarmAt(stub)).toBe(NEXT_DAY);
   });
 
+  it("resumes a run interrupted during wake polling and locks tonight exactly once", async () => {
+    const tesla = new FakeTesla();
+    tesla.state = "offline";
+    tesla.pollsUntilOnline = 2;
+    const stub = await setup(tesla);
+    // Simulate an eviction mid-run: the alarm fails while polling for online.
+    await runInDurableObject(stub, async (instance: OwnerState) => {
+      instance.sleep = async () => {
+        throw new Error("simulated eviction");
+      };
+      await expect(instance.alarm()).rejects.toThrow("simulated eviction");
+    });
+    expect(tesla.car.commands).toBe(0);
+    // A cron tick while the run is pending keeps tonight's alarm armed.
+    await runInDurableObject(stub, (instance: OwnerState) => {
+      instance.clock = () => RUN_AT + 15 * 60_000;
+      instance.sleep = async () => {};
+    });
+    expect(await stub.ensureAlarm()).toEqual({ nextRun: new Date(RUN_AT).toISOString() });
+    expect(await alarmAt(stub)).toBe(RUN_AT);
+
+    // The retried alarm resumes the pending run.
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.car.locked).toBe(true);
+    expect(tesla.car.commands).toBe(1);
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ localDate: "2030-06-15", outcome: "ok" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+    const rows = await stub.auditRecent(10);
+    expect(rows.some((row) => row.action === "nightly_lock" && row.detail === "resumed run=2")).toBe(true);
+
+    // The finished night never runs again.
+    await runInDurableObject(stub, async (instance: OwnerState, state) => {
+      state.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'scheduled_for'", String(RUN_AT));
+      await instance.alarm();
+    });
+    expect(tesla.car.commands).toBe(1);
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+  });
+
+  it("ignores a second delivery while the run is still in flight", async () => {
+    const tesla = new FakeTesla();
+    tesla.state = "offline";
+    tesla.pollsUntilOnline = 1;
+    const stub = await setup(tesla);
+    await runInDurableObject(stub, async (instance: OwnerState) => {
+      let entered!: () => void;
+      const polling = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let first = true;
+      instance.sleep = async () => {
+        if (!first) return;
+        first = false;
+        entered();
+        await gate;
+      };
+      const running = instance.alarm();
+      await polling;
+      // The cron tick and a duplicate delivery during the run change nothing.
+      expect(await instance.ensureAlarm()).toEqual({ nextRun: new Date(RUN_AT).toISOString() });
+      await instance.alarm();
+      release();
+      await running;
+    });
+    expect(tesla.car.commands).toBe(1);
+    expect(tesla.fleetRequests.filter((request) => request.path.endsWith("/wake_up"))).toHaveLength(1);
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+  });
+
+  it("caps resumes at three per night and then schedules tomorrow", async () => {
+    const tesla = new FakeTesla();
+    tesla.state = "offline";
+    tesla.pollsUntilOnline = Number.POSITIVE_INFINITY;
+    const stub = await setup(tesla);
+    await runInDurableObject(stub, async (instance: OwnerState) => {
+      instance.sleep = async () => {
+        throw new Error("simulated eviction");
+      };
+      for (let run = 0; run < 4; run++) {
+        await expect(instance.alarm()).rejects.toThrow("simulated eviction");
+      }
+      // The fifth delivery gives up without calling Tesla.
+      await instance.alarm();
+    });
+    expect(tesla.car.commands).toBe(0);
+    expect(tesla.fleetRequests.filter((request) => request.path.endsWith("/wake_up"))).toHaveLength(4);
+    const [row] = await stub.auditRecent(1);
+    expect(row).toMatchObject({ action: "nightly_lock", outcome: "error", detail: "abandoned runs=4" });
+    expect((await stub.nightlyLockStatus()).lastRun).toMatchObject({ localDate: "2030-06-15", outcome: "error" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+    await runInDurableObject(stub, async (instance: OwnerState, state) => {
+      state.storage.sql.exec("UPDATE kv SET value = ? WHERE key = 'scheduled_for'", String(RUN_AT));
+      await instance.alarm();
+    });
+    expect(tesla.fleetRequests.filter((request) => request.path.endsWith("/wake_up"))).toHaveLength(4);
+  });
+
+  it("audits an interrupted run as missed once it is more than three hours late", async () => {
+    const tesla = new FakeTesla();
+    tesla.state = "offline";
+    const stub = await setup(tesla);
+    await runInDurableObject(stub, async (instance: OwnerState) => {
+      instance.sleep = async () => {
+        throw new Error("simulated eviction");
+      };
+      await expect(instance.alarm()).rejects.toThrow("simulated eviction");
+      instance.clock = () => RUN_AT + 3 * 60 * 60_000 + 60_000;
+    });
+    const before = tesla.fleetRequests.length;
+    expect(await stub.ensureAlarm()).toEqual({ nextRun: new Date(RUN_AT).toISOString() });
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    expect(tesla.fleetRequests).toHaveLength(before);
+    const [row] = await stub.auditRecent(1);
+    expect(row).toMatchObject({ action: "nightly_lock", outcome: "error", detail: "missed after interruption" });
+    expect(await alarmAt(stub)).toBe(NEXT_DAY);
+  });
+
   it("respects NIGHTLY_LOCK_ENABLED", async () => {
     const tesla = new FakeTesla();
     tesla.install();
