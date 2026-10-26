@@ -14,6 +14,8 @@ concurrency:
 
 jobs:
   verify:
+    # Fork PRs must not run on the self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, tesla-mcp]
     timeout-minutes: 15
     steps:
@@ -33,6 +35,8 @@ jobs:
           WRANGLER_SEND_METRICS: "false"
 
   secret-scan:
+    # Fork PRs must not run on the self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, tesla-mcp]
     timeout-minutes: 10
     env:
@@ -59,6 +63,8 @@ jobs:
         run: gitleaks git --redact --exit-code 1 .
 
   go-conformance:
+    # Fork PRs must not run on the self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Linux, X64, tesla-mcp]
     timeout-minutes: 10
     steps:
@@ -73,6 +79,8 @@ jobs:
         run: bash conformance/run.sh
 
   deploy-dry-run:
+    # Fork PRs must not run on the self-hosted runner.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: Oceanswave/github-workflows/.github/workflows/wrangler-deploy.yml@125b14d3312b525c8f5b42e9f1c7a9e172d1b23f
     with:
       runs-on: '["self-hosted","Linux","X64","tesla-mcp"]'
