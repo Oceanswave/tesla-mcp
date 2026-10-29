@@ -31,7 +31,7 @@ scope it needs; see [Scopes](#scopes).
 | `tesla_vehicle_status` | read    | Get the car's current status: online or asleep, and when online whether it is locked, which doors, trunks, or windows are open, battery percent, range, charging state, inside and outside temperature, climate, Sentry Mode, and odometer. |
 | `tesla_wake`           | command | Wake the car so it can report status or take commands.                                                                                                                                                                                      |
 | `tesla_lock`           | command | Lock the car's doors with a signed command.                                                                                                                                                                                                 |
-| `tesla_auth_status`    | read    | Report whether the server's Tesla sign-in works: authState is ok, reauth_required (Tesla rejected the sign-in; the owner must set a new refresh token), or not_configured.                                                                  |
+| `tesla_auth_status`    | read    | Report whether the server's Tesla sign-in works (authState ok, reauth_required, or not_configured) and, when ok, the OAuth scopes the sign-in grants.                                                                                       |
 | `tesla_audit_recent`   | read    | Show the most recent entries in the audit log of commands, wakes, and sign-in events, newest first.                                                                                                                                         |
 | `tesla_vehicle_ping`   | read    | Check that the car is online and accepts this server's signed commands (its virtual key is paired) by sending a signed no-op.                                                                                                               |
 
@@ -244,10 +244,13 @@ Every call is in the audit log (`tesla_audit_recent`).
 
 ## Scopes
 
-The Worker does not choose scopes: it refreshes the token you signed in with, so tools can only do what that sign-in
-allows. The setup below requests `openid offline_access vehicle_device_data vehicle_cmds`, which covers every
-vehicle tool except `tesla_vehicle_charging_history` and location data. The others need more scopes in your
-developer app and sign-in:
+Browser sign-in (`/login`) asks Tesla for all nine scopes the tools use, with `prompt_missing_scopes=true` so an
+earlier, narrower grant is widened:
+`openid offline_access vehicle_device_data vehicle_cmds vehicle_location vehicle_charging_cmds user_data energy_device_data energy_cmds`.
+Your developer app must allow each of them (tick them in the developer portal), or Tesla grants fewer. Tesla may
+also let the owner untick some on its consent page. `tesla_auth_status` lists the scopes the stored sign-in
+actually has. `openid offline_access vehicle_device_data vehicle_cmds` covers every vehicle tool except
+`tesla_vehicle_charging_history` and location data. The rest need:
 
 | Scope                   | Tools                                                                                              |
 | ----------------------- | -------------------------------------------------------------------------------------------------- |
@@ -257,15 +260,18 @@ developer app and sign-in:
 | `energy_device_data`    | the `tesla_energy_*` read tools                                                                    |
 | `energy_cmds`           | the `tesla_energy_set_*` tools                                                                     |
 
-Without them those tools fail with `forbidden` and name the missing scope. [GAP.md](GAP.md) has the full mapping.
+Without them those tools fail with `forbidden` and name the missing scope. A refresh token from elsewhere
+(`TESLA_BOOTSTRAP_REFRESH_TOKEN`) keeps whatever scopes it was issued with. [GAP.md](GAP.md) has the full mapping.
 
 ## Self-hosting
 
 You need a Tesla developer account, a Cloudflare account, and a domain you control (Tesla fetches your public key
 from it). Node 22 or newer.
 1. **Create a Tesla developer application** at [developer.tesla.com](https://developer.tesla.com). Set the allowed
-   origin to `https://<your-domain>` and the redirect URI to `https://<your-domain>/callback`. Request the scopes
-   `openid offline_access vehicle_device_data vehicle_cmds`.
+   origin to `https://<your-domain>` and the redirect URI to `https://<your-domain>/callback`, the same value
+   `OAUTH_REDIRECT_BASE` will produce (step 3). Tesla's portal rejects domains that contain "tesla". Tick the scopes listed under [Scopes](#scopes): vehicle information,
+   vehicle location, vehicle commands, vehicle charging management, profile information, energy product
+   information, and energy product commands.
 
 2. **Generate a P-256 command key** somewhere outside this repository (`*.pem` and `keys/` are gitignored, but keep
    the private key off disk where you can):
@@ -278,7 +284,8 @@ from it). Node 22 or newer.
 3. **Publish the public key.** Put the contents of `public-key.pem` in `TESLA_PUBLIC_KEY_PEM` in `wrangler.jsonc`
    (newlines as `\n`). After deploying, it is served at
    `https://<your-domain>/.well-known/appspecific/com.tesla.3p.public-key.pem`. If your account is outside North
-   America, change `TESLA_FLEET_BASE_URL` to your region's Fleet API host.
+   America, change `TESLA_FLEET_BASE_URL` to your region's Fleet API host. Set `OAUTH_REDIRECT_BASE` to
+   `https://<your-domain>`: browser sign-in sends Tesla `${OAUTH_REDIRECT_BASE}/callback`.
 
 4. **Set secrets** (see `.dev.vars.example` for what each one is):
 
@@ -289,7 +296,7 @@ from it). Node 22 or newer.
    openssl pkcs8 -topk8 -nocrypt -in private-key.pem -outform DER | base64 | tr -d '\n' \
      | npx wrangler secret put TESLA_COMMAND_PRIVATE_KEY_PKCS8_B64
    openssl rand -base64 32 | npx wrangler secret put TOKEN_ENCRYPTION_KEY
-   npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN   # see step 7
+   npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN   # optional, see step 7
    npx wrangler secret put TESLA_VEHICLE_ID                # optional
    ```
 
@@ -309,17 +316,36 @@ from it). Node 22 or newer.
      -d '{"domain":"<your-domain>"}'
    ```
 
-7. **Get a refresh token for your account.** Browser sign-in is not built yet. Complete Tesla's OAuth
-   authorization-code flow once (for example with Tesla's documented flow or a tool you trust), then store the
-   refresh token with `wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. It seeds the encrypted token store;
-   Tesla rotates refresh tokens, and the Worker keeps the newest. Do not share that refresh token with another
-   Tesla tool: whichever one refreshes second is locked out.
+7. **Sign in with Tesla.** Open `https://<your-domain>/login` in a browser, sign in to Tesla, and approve the
+   scopes. Tesla sends you back to `/callback`, which exchanges the code, stores the tokens encrypted (replacing
+   any stored ones), and shows `Tesla sign-in updated, scopes: ...` with the scopes Tesla granted. The link from
+   `/login` works once, for ten minutes. The redirect URI sent to Tesla is `${OAUTH_REDIRECT_BASE}/callback`, from the
+   non-secret `OAUTH_REDIRECT_BASE` var in `wrangler.jsonc` (an https URL; a trailing slash is dropped). It is
+   never taken from the request host, and it must match a redirect URI in the developer app exactly. Tesla
+   rotates refresh tokens and the Worker keeps the newest, so do not share this sign-in with another Tesla tool:
+   whichever one refreshes second is locked out.
+
+   `/login` is public, so the server remembers which Tesla account its tokens belong to (the access token's
+   `sub`), and `/callback` refuses any other account and changes nothing. A `TESLA_BOOTSTRAP_REFRESH_TOKEN` not
+   used yet is tried before the code, so it names the account first. On a server that has never held a token,
+   the first sign-in names the account: sign in right after the first deploy (or set the bootstrap token). To move
+   the server to another account, set a refresh token for it with `TESLA_BOOTSTRAP_REFRESH_TOKEN` (below).
+
+   Instead of the browser, you can complete Tesla's authorization-code flow elsewhere and store the refresh token
+   with `npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. It seeds the encrypted token store once per
+   distinct value; a browser sign-in supersedes the value set at the time.
+
+   **Moving sign-in to another domain.** Set `OAUTH_REDIRECT_BASE` in `wrangler.jsonc` to the new
+   `https://<base>` and deploy, register `https://<base>/callback` as a redirect URI (and the origin as an allowed
+   origin) in the developer app at developer.tesla.com, and route the domain to the Worker (Domains & Routes →
+   Custom domain). A `/login` link opened before the change no longer completes; start again at `/login`. If the
+   var is missing or not an https URL, `/login` and `/callback` show a configuration error and change nothing.
 
    **Signing in again (`reauth_required`).** If Tesla rejects the stored sign-in (a revoked or expired refresh
    token), every tool fails with `reauth_required`, a code-only error is logged, and no further refreshes are tried.
-   One step fixes it: get a new refresh token and run `npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. Any
-   value that has not been seeded before replaces the stored tokens on the next request; setting the same value
-   again does nothing.
+   Open `https://<your-domain>/login` again. Alternatively, run `npx wrangler secret put
+   TESLA_BOOTSTRAP_REFRESH_TOKEN` with a new refresh token: any value that has not been seeded before replaces the
+   stored tokens on the next request; setting the same value again does nothing.
 
 8. **Pair the virtual key with the car.** On the phone with the Tesla app, open `https://tesla.com/_ak/<your-domain>`
    and approve the key. Signed commands fail with "pairing required" until this is done.

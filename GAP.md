@@ -70,34 +70,32 @@ registered when `DANGEROUS_COMMANDS_ENABLED` is `"true"`.
 
 ## OAuth scopes: what the app requests vs. what tools need
 
-**What the app requests today.** The Worker never requests scopes itself: it refreshes a token whose scopes
-were fixed when the owner signed in. The only scope lists in the repository are in the README:
-- Step 1 (developer app): `openid offline_access vehicle_device_data vehicle_cmds`
-- Step 6 (partner token for registration): `openid vehicle_device_data vehicle_cmds`
-
-This change does not alter either list.
+**What the app requests today.** Browser sign-in (`/login`, `SIGN_IN_SCOPES` in `src/tesla/endpoints.ts`)
+asks for all nine scopes below that a tool uses, with `prompt_missing_scopes=true`. Tesla grants only those the
+developer app allows (README step 1) and the owner approves; `tesla_auth_status` reports what the stored sign-in
+has. A refresh token set with `TESLA_BOOTSTRAP_REFRESH_TOKEN` keeps the scopes it was issued with. The partner
+token for registration (README step 6) still asks for `openid vehicle_device_data vehicle_cmds`.
 
 **What each tool needs.** Tesla's current endpoint pages no longer print a per-endpoint scope line. The mapping
 below follows Tesla's scope definitions (authentication overview) and its earlier per-endpoint lists. Each
 tool's description names its scope, and a 403 error repeats it.
 
-| Scope                                   | Requested today          | Tools that need it                                                                                                                                                                                                                                                                                                                      |
+| Scope                                   | Requested at sign-in     | Tools that need it                                                                                                                                                                                                                                                                                                                      |
 | --------------------------------------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `vehicle_device_data`                   | yes                      | 19 tools: 18 vehicle reads (list, status, data, cached data, mobile access, nearby chargers, alerts, release notes, service, fleet status, options, warranty, two eligibility lists, drivers, invites, Fleet Telemetry config and errors) and `tesla_vehicle_fleet_telemetry_config_delete`; it also satisfies `tesla_account_products` |
 | `vehicle_cmds`                          | yes                      | 70 tools: `tesla_wake`, `tesla_lock`, `tesla_vehicle_ping`, the 59 non-charging signed commands, the 5 REST commands (navigation, Boombox), driver removal, and share invite create/revoke; it also satisfies the 14 charging commands                                                                                                  |
-| `vehicle_location`                      | **no**                   | `tesla_vehicle_data` with `location_data` (also needs `vehicle_device_data`)                                                                                                                                                                                                                                                            |
-| `vehicle_charging_cmds`                 | **no**                   | `tesla_vehicle_charging_history` (the 14 charging commands accept it or `vehicle_cmds`)                                                                                                                                                                                                                                                 |
-| `user_data`                             | **no**                   | `tesla_account_me`, `tesla_account_region`, `tesla_account_orders`, `tesla_account_feature_config`                                                                                                                                                                                                                                      |
-| `energy_device_data`                    | **no**                   | 9 energy read tools (live status, site info, site status, backup time, energy/backup/charge history, charger live status, tariff)                                                                                                                                                                                                       |
-| `energy_cmds`                           | **no**                   | 6 energy settings tools (backup reserve, operation mode, Storm Watch, grid import/export, off-grid vehicle reserve, time of use)                                                                                                                                                                                                        |
+| `vehicle_location`                      | yes (`/login`)           | `tesla_vehicle_data` with `location_data` (also needs `vehicle_device_data`)                                                                                                                                                                                                                                                            |
+| `vehicle_charging_cmds`                 | yes (`/login`)           | `tesla_vehicle_charging_history` (the 14 charging commands accept it or `vehicle_cmds`)                                                                                                                                                                                                                                                 |
+| `user_data`                             | yes (`/login`)           | `tesla_account_me`, `tesla_account_region`, `tesla_account_orders`, `tesla_account_feature_config`                                                                                                                                                                                                                                      |
+| `energy_device_data`                    | yes (`/login`)           | 9 energy read tools (live status, site info, site status, backup time, energy/backup/charge history, charger live status, tariff)                                                                                                                                                                                                       |
+| `energy_cmds`                           | yes (`/login`)           | 6 energy settings tools (backup reserve, operation mode, Storm Watch, grid import/export, off-grid vehicle reserve, time of use)                                                                                                                                                                                                        |
 | `vehicle_specs`, `vehicle_pricing_info` | no (partner tokens only) | none: specs and pricing are not implemented                                                                                                                                                                                                                                                                                             |
 | `enterprise_management`                 | no (business)            | none: enterprise endpoints are not implemented                                                                                                                                                                                                                                                                                          |
 
-So with the scopes requested today, **20 tools cannot succeed**: 9 energy reads, 6 energy settings, 4 account
-tools, and charging history. `tesla_vehicle_data` also fails when it asks for `location_data`. They are still
-registered: they are generic, a self-hoster may grant those scopes, and each one fails with a clear `forbidden`
-error that names the scope. Getting them working needs a new sign-in with the added scopes (and the developer
-app allowed to request them); no code change.
+Before browser sign-in, the setup guide requested only `vehicle_device_data` and `vehicle_cmds`, so 20 tools
+(9 energy reads, 6 energy settings, 4 account tools, and charging history) and `tesla_vehicle_data` with
+`location_data` could not succeed. A `/login` sign-in requests every scope above; any scope the developer app does
+not allow or the owner does not approve still fails with a clear `forbidden` error that names it.
 
 ## Not implemented, and why
 

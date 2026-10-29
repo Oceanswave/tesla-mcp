@@ -32,8 +32,8 @@ describe("routes", () => {
     expect(new TextDecoder().decode(await response.arrayBuffer())).toBe(env.TESLA_PUBLIC_KEY_PEM);
   });
 
-  it("serves the home page, health check, and callback placeholder with security headers", async () => {
-    for (const path of ["/", "/healthz", "/callback"]) {
+  it("serves the home page and health check with security headers", async () => {
+    for (const path of ["/", "/healthz"]) {
       const response = await SELF.fetch(`${BASE}${path}`);
       expect(response.status).toBe(200);
       expect(response.headers.get("X-Content-Type-Options")).toBe("nosniff");
@@ -49,6 +49,9 @@ describe("routes", () => {
       expect((await SELF.fetch(`${BASE}${path}`)).status).toBe(404);
     }
     expect((await SELF.fetch(`${BASE}/healthz`, { method: "POST" })).status).toBe(404);
+    for (const path of ["/login", "/callback"]) {
+      expect((await SELF.fetch(`${BASE}${path}`, { method: "POST" })).status).toBe(404);
+    }
   });
 });
 

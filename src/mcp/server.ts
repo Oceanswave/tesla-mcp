@@ -303,7 +303,7 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_auth_status",
       description:
-        "Report whether the server's Tesla sign-in works: authState is ok, reauth_required (Tesla rejected the sign-in; the owner must set a new refresh token), or not_configured. Reads stored state only; never contacts Tesla or wakes the car.",
+        "Report whether the server's Tesla sign-in works: authState is ok, reauth_required (Tesla rejected the sign-in; the owner must sign in again at /login), or not_configured. When ok, scopes lists the OAuth scopes the stored sign-in grants (null when unknown). Reads stored state only; never contacts Tesla or wakes the car.",
       inputSchema: z.object({}).strict(),
       annotations: { ...READ, openWorldHint: false },
       handler: async () => {
