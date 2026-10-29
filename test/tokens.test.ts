@@ -157,7 +157,7 @@ describe("OwnerState Tesla tokens", () => {
       expect(await instance.authStatus()).toMatchObject({ authState: "not_configured" });
       Object.assign(instance, { env });
       // A bootstrap token not yet tried counts as ok: the next request uses it.
-      expect(await instance.authStatus()).toEqual({ authState: "ok", message: null });
+      expect(await instance.authStatus()).toEqual({ authState: "ok", message: null, scopes: null });
       await expect(instance.getAccessToken()).rejects.toThrow(/sign-in has expired/);
       expect(await instance.authStatus()).toMatchObject({ authState: "reauth_required" });
       // Setting a new value is reported as ok before any request uses it.

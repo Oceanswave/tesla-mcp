@@ -20,4 +20,6 @@ export interface Env {
   TOKEN_ENCRYPTION_KEY?: string;
   TESLA_BOOTSTRAP_REFRESH_TOKEN?: string;
   TESLA_VEHICLE_ID?: string;
+  /** The redirect URI registered with Tesla. Unset: this origin's /callback. */
+  TESLA_REDIRECT_URI?: string;
 }

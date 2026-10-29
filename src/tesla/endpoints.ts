@@ -22,14 +22,18 @@ export const FLEET_SCOPES = [
 
 export type FleetScope = (typeof FLEET_SCOPES)[number];
 
-/** The scopes the self-hosting guide (README step 1) asks the app to request.
- * Documentation only: the Worker never asks for scopes itself (it refreshes
- * a token whose scopes were fixed at sign-in). */
-export const SETUP_SCOPES = [
+/** The scopes /login asks Tesla for (with prompt_missing_scopes, so an
+ * earlier, narrower grant is widened). The developer app must allow each. */
+export const SIGN_IN_SCOPES = [
   "openid",
   "offline_access",
   "vehicle_device_data",
   "vehicle_cmds",
+  "vehicle_location",
+  "vehicle_charging_cmds",
+  "user_data",
+  "energy_device_data",
+  "energy_cmds",
 ] as const satisfies readonly FleetScope[];
 
 export const VEHICLE_DATA_ENDPOINTS = [

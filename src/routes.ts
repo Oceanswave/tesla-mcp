@@ -1,11 +1,14 @@
-// HTTP routes: security headers, the public key, and the /mcp transport.
+// HTTP routes: security headers, the public key, browser sign-in (/login and
+// /callback), and the /mcp transport.
 // Kept out of index.ts because the Worker entry module may only export
 // handlers and Durable Object classes.
 
 import { createMcpHandler } from "@modelcontextprotocol/server";
-import { bearerTokenAuthenticator, type McpAuthenticator } from "./auth";
+import { bearerTokenAuthenticator, type McpAuthenticator, OWNER_ID } from "./auth";
 import type { Env } from "./env";
 import { createMcpServer } from "./mcp/server";
+import type { SignInResult } from "./owner/state";
+import { authorizeUrl, signInRedirectUri } from "./tesla/oauth";
 
 export const PUBLIC_KEY_PATH = "/.well-known/appspecific/com.tesla.3p.public-key.pem";
 export const MAX_MCP_BODY_BYTES = 65_536;
@@ -38,12 +41,59 @@ const HOME_PAGE = `<!doctype html>
 </body></html>
 `;
 
-const CALLBACK_PAGE = `<!doctype html>
+function escapeHtml(value: string): string {
+  return value.replace(
+    /[&<>"']/g,
+    (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char,
+  );
+}
+
+/** A plain sign-in page. `message` is escaped; it never carries a code or token. */
+function signInPage(message: string, status: number): Response {
+  return text(
+    `<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>tesla-mcp sign-in</title></head>
 <body><h1>Tesla sign-in</h1>
-<p>Browser sign-in is not available yet. You can close this window.</p>
+<p>${escapeHtml(message)}</p>
 </body></html>
-`;
+`,
+    status,
+    "text/html; charset=utf-8",
+  );
+}
+
+const SIGN_IN_FAILURES: Record<Exclude<SignInResult, { ok: true }>["reason"], [string, number]> = {
+  invalid_state: ["This sign-in link is missing, expired, or already used. Start again at /login.", 400],
+  denied: ["Tesla sign-in was cancelled or refused. Start again at /login.", 400],
+  not_configured: ["Tesla sign-in is not configured on this server.", 503],
+  exchange_failed: ["Tesla did not accept the sign-in. Start again at /login.", 502],
+  account_mismatch: ["That is a different Tesla account from the one this server uses. Nothing was changed.", 403],
+};
+
+async function handleLogin(url: URL, env: Env, ownerId: string): Promise<Response> {
+  const clientId = env.TESLA_CLIENT_ID?.trim();
+  const redirectUri = signInRedirectUri(env.TESLA_REDIRECT_URI, url);
+  if (!clientId || !redirectUri) return signInPage(SIGN_IN_FAILURES.not_configured[0], 503);
+  const owner = env.OWNER.get(env.OWNER.idFromName(ownerId));
+  const state = await owner.beginSignIn(redirectUri);
+  return new Response(null, { status: 302, headers: { Location: authorizeUrl({ clientId, redirectUri, state }) } });
+}
+
+async function handleCallback(url: URL, env: Env, ownerId: string): Promise<Response> {
+  const param = (name: string) => {
+    const value = url.searchParams.get(name);
+    return value && /^[\x21-\x7e]{1,2048}$/.test(value) ? value : null;
+  };
+  const owner = env.OWNER.get(env.OWNER.idFromName(ownerId));
+  const result = await owner.completeSignIn({
+    state: param("state") ?? "",
+    code: param("code"),
+    error: url.searchParams.has("error") ? "error" : null,
+  });
+  if (result.ok) return signInPage(`Tesla sign-in updated, scopes: ${result.scope || "none reported"}`, 200);
+  const [message, status] = SIGN_IN_FAILURES[result.reason];
+  return signInPage(message, status);
+}
 
 async function readBoundedBody(request: Request): Promise<Uint8Array | null> {
   const declared = request.headers.get("Content-Length");
@@ -98,10 +148,13 @@ async function handleMcp(request: Request, env: Env, authenticator: McpAuthentic
   return response;
 }
 
+/** `signInOwnerId` names the OwnerState that browser sign-in updates (the
+ * single owner; tests pass their own). */
 export async function handleRequest(
   request: Request,
   env: Env,
   authenticator: McpAuthenticator = bearerTokenAuthenticator,
+  signInOwnerId: string = OWNER_ID,
 ): Promise<Response> {
   const url = new URL(request.url);
   const read = request.method === "GET" || request.method === "HEAD";
@@ -113,6 +166,10 @@ export async function handleRequest(
   if (read && url.pathname === PUBLIC_KEY_PATH) {
     return secure(text(env.TESLA_PUBLIC_KEY_PEM, 200, "application/x-pem-file"), "public, max-age=3600");
   }
-  if (read && url.pathname === "/callback") return secure(text(CALLBACK_PAGE, 200, "text/html; charset=utf-8"));
+  // GET only: a HEAD (a link check, a prefetch) must not create or consume a sign-in.
+  if (request.method === "GET" && url.pathname === "/login") return secure(await handleLogin(url, env, signInOwnerId));
+  if (request.method === "GET" && url.pathname === "/callback") {
+    return secure(await handleCallback(url, env, signInOwnerId));
+  }
   return secure(text("Not found\n", 404));
 }

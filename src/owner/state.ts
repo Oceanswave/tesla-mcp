@@ -18,6 +18,7 @@ import {
 } from "../tesla/endpoints";
 import { FleetClient, FleetError, summarizeVehicleData, type VehicleSummary } from "../tesla/fleet";
 import { defaultFetch, type FetchFn, fetchUpstream, readBoundedText } from "../tesla/http";
+import { accessTokenClaims, newSignInState, SIGN_IN_STATE_PATTERN, SIGN_IN_STATE_TTL_MS } from "../tesla/oauth";
 import type { CommandParams } from "../tesla/vcp/payloads";
 import { isSignedCommandName, type SignedCommandName } from "../tesla/vcp/protocol";
 import type { SignedCommandResult, VcpErrorCode } from "../tesla/vcp/session";
@@ -30,10 +31,13 @@ const MAX_TOKEN_BODY_BYTES = 32_768;
 const AUDIT_KEEP_ROWS = 1000;
 const VEHICLE_CACHE_MS = 5 * 60_000;
 const ID_PATTERN = /^\d{1,20}$/;
+/** Anyone can open /login: pending sign-ins beyond this many drop the oldest. */
+const MAX_PENDING_SIGN_INS = 100;
 
 /** The one-step fix for a rejected Tesla sign-in, shown to callers. */
 const REAUTH_MESSAGE =
-  "Tesla sign-in has expired or was revoked. Get a new Tesla refresh token and set it with " +
+  "Tesla sign-in has expired or was revoked. Sign in again by opening /login on this server in a browser, " +
+  "or get a new Tesla refresh token and set it with " +
   "`npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`; the next request uses it.";
 const NOT_CONNECTED_MESSAGE = "No Tesla account is connected yet.";
 
@@ -122,7 +126,27 @@ async function fingerprint(value: string): Promise<string> {
  * did; set a new bootstrap refresh token. "not_configured": no account yet. */
 export type AuthState = "ok" | "reauth_required" | "not_configured";
 
-export type AuthStatus = { authState: AuthState; message: string | null };
+/** `scopes` are the ones granted to the stored access token (its `scp`
+ * claim), when the state is ok and the token is readable. */
+export type AuthStatus = { authState: AuthState; message: string | null; scopes: string[] | null };
+
+/** What /callback shows. Failure reasons are fixed codes, never Tesla text. */
+export type SignInResult =
+  | { ok: true; scope: string }
+  | { ok: false; reason: "invalid_state" | "denied" | "not_configured" | "exchange_failed" | "account_mismatch" };
+
+type IssuedTokens = { accessToken: string; refreshToken: string | null; expiresIn: number };
+
+/** The tokens in a 200 answer from Tesla's token endpoint, or null. */
+function issuedTokens(body: Record<string, unknown>): IssuedTokens | null {
+  const accessToken = body.access_token;
+  if (typeof accessToken !== "string" || !accessToken) return null;
+  return {
+    accessToken,
+    refreshToken: typeof body.refresh_token === "string" && body.refresh_token ? body.refresh_token : null,
+    expiresIn: typeof body.expires_in === "number" && body.expires_in > 0 ? body.expires_in : 900,
+  };
+}
 
 export class OwnerState extends DurableObject<Env> {
   /** Injection points for tests. Production uses the real clock and timers. */
@@ -149,6 +173,11 @@ export class OwnerState extends DurableObject<Env> {
         vehicle_id TEXT,
         outcome TEXT NOT NULL,
         detail TEXT NOT NULL
+      )`);
+      ctx.storage.sql.exec(`CREATE TABLE IF NOT EXISTS sign_in_state (
+        state TEXT PRIMARY KEY,
+        redirect_uri TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
       )`);
       // Left behind by the removed built-in nightly lock: its alarm and keys.
       await ctx.storage.deleteAlarm();
@@ -301,16 +330,16 @@ export class OwnerState extends DurableObject<Env> {
     return this.refresh(tokens);
   }
 
-  private async refresh(tokens: StoredTokens): Promise<string> {
+  /** POST one grant to Tesla's token endpoint. The client fields follow the
+   * grant's own fields (same form hermes-tescmd-plugin sends for a refresh);
+   * client_secret only when configured. */
+  private async tokenRequest(
+    action: string,
+    grant: Record<string, string>,
+  ): Promise<{ status: number; body: Record<string, unknown> }> {
     const clientId = this.env.TESLA_CLIENT_ID;
     if (!clientId) throw new OwnerError("not_configured", "TESLA_CLIENT_ID is not configured.");
-    // Same form hermes-tescmd-plugin sends (client.refresh_access_token).
-    const form = new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: tokens.refreshToken,
-      client_id: clientId,
-      audience: this.env.TESLA_FLEET_BASE_URL,
-    });
+    const form = new URLSearchParams({ ...grant, client_id: clientId, audience: this.env.TESLA_FLEET_BASE_URL });
     if (this.env.TESLA_CLIENT_SECRET) form.set("client_secret", this.env.TESLA_CLIENT_SECRET);
 
     let response: Response;
@@ -329,7 +358,7 @@ export class OwnerState extends DurableObject<Env> {
         TOKEN_TIMEOUT_MS,
       );
     } catch {
-      this.audit({ source: "system", action: "token_refresh", vehicleId: null, outcome: "error", detail: "transport" });
+      this.audit({ source: "system", action, vehicleId: null, outcome: "error", detail: "transport" });
       throw new OwnerError("token_refresh_failed", "Tesla sign-in service is unreachable. Try again shortly.");
     }
 
@@ -342,9 +371,32 @@ export class OwnerState extends DurableObject<Env> {
     } catch {
       body = {};
     }
+    return { status: response.status, body };
+  }
+
+  /** Tesla rotates refresh tokens and invalidates the old one: persist the
+   * new pair before anyone can use the access token. Runs only inside the
+   * token flight. */
+  private async storeTokens(issued: IssuedTokens, previousRefreshToken: string | null): Promise<void> {
+    const refreshToken = issued.refreshToken ?? previousRefreshToken;
+    if (!refreshToken) throw new OwnerError("token_refresh_failed", "Tesla did not issue a refresh token.");
+    const encrypted = await encryptTokens(await this.tokenKey(), {
+      accessToken: issued.accessToken,
+      refreshToken,
+      expiresAt: this.clock() + Math.min(issued.expiresIn, 30 * 86_400) * 1000,
+    });
+    this.kvSet("tokens", encrypted);
+    this.refreshCount++;
+  }
+
+  private async refresh(tokens: StoredTokens): Promise<string> {
+    const { status, body } = await this.tokenRequest("token_refresh", {
+      grant_type: "refresh_token",
+      refresh_token: tokens.refreshToken,
+    });
     const errorCode = typeof body.error === "string" ? body.error : "";
     if (
-      response.status === 401 ||
+      status === 401 ||
       errorCode === "invalid_grant" ||
       errorCode === "login_required" ||
       errorCode === "unauthorized_client"
@@ -357,34 +409,24 @@ export class OwnerState extends DurableObject<Env> {
         action: "token_refresh",
         vehicleId: null,
         outcome: "error",
-        detail: `reauth_required ${response.status} ${errorCode.slice(0, 32)}`,
+        detail: `reauth_required ${status} ${errorCode.slice(0, 32)}`,
       });
-      console.error(`[tesla-mcp] reauth_required: Tesla rejected the refresh token (http ${response.status})`);
+      console.error(`[tesla-mcp] reauth_required: Tesla rejected the refresh token (http ${status})`);
       throw new OwnerError("reauth_required", REAUTH_MESSAGE);
     }
-    const accessToken = body.access_token;
-    if (response.status !== 200 || typeof accessToken !== "string" || !accessToken) {
+    const issued = status === 200 ? issuedTokens(body) : null;
+    if (!issued) {
       this.audit({
         source: "system",
         action: "token_refresh",
         vehicleId: null,
         outcome: "error",
-        detail: `http_${response.status}`,
+        detail: `http_${status}`,
       });
       throw new OwnerError("token_refresh_failed", "Tesla sign-in service returned an error. Try again shortly.");
     }
-    const rotated = typeof body.refresh_token === "string" && body.refresh_token ? body.refresh_token : null;
-    const expiresIn = typeof body.expires_in === "number" && body.expires_in > 0 ? body.expires_in : 900;
-    // Tesla rotates refresh tokens and invalidates the old one: persist the
-    // new pair before anyone can use the access token.
-    const encrypted = await encryptTokens(await this.tokenKey(), {
-      accessToken,
-      refreshToken: rotated ?? tokens.refreshToken,
-      expiresAt: this.clock() + Math.min(expiresIn, 30 * 86_400) * 1000,
-    });
-    this.kvSet("tokens", encrypted);
-    this.refreshCount++;
-    return accessToken;
+    await this.storeTokens(issued, tokens.refreshToken);
+    return issued.accessToken;
   }
 
   private fleet(): FleetClient {
@@ -861,12 +903,133 @@ export class OwnerState extends DurableObject<Env> {
   async authStatus(): Promise<AuthStatus> {
     const bootstrap = this.env.TESLA_BOOTSTRAP_REFRESH_TOKEN?.trim();
     const newBootstrap = bootstrap ? this.kvGet("seed_fingerprint") !== (await fingerprint(bootstrap)) : false;
-    if (newBootstrap) return { authState: "ok", message: null };
+    if (newBootstrap) return { authState: "ok", message: null, scopes: null };
     if (this.kvGet("auth_state") === "reauth_required")
-      return { authState: "reauth_required", message: REAUTH_MESSAGE };
-    if (!this.kvGet("tokens")) return { authState: "not_configured", message: NOT_CONNECTED_MESSAGE };
-    return { authState: "ok", message: null };
+      return { authState: "reauth_required", message: REAUTH_MESSAGE, scopes: null };
+    if (!this.kvGet("tokens")) return { authState: "not_configured", message: NOT_CONNECTED_MESSAGE, scopes: null };
+    return { authState: "ok", message: null, scopes: (await this.storedClaims()).scopes };
   }
+
+  /** Claims of the stored access token; nulls when there is none. */
+  private async storedClaims(): Promise<ReturnType<typeof accessTokenClaims>> {
+    const blob = this.kvGet("tokens");
+    try {
+      return accessTokenClaims(blob ? (await decryptTokens(await this.tokenKey(), blob)).accessToken : null);
+    } catch {
+      return accessTokenClaims(null);
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Browser sign-in (/login and /callback)
+  // ---------------------------------------------------------------------------
+
+  /** Start a browser sign-in: a single-use state value, valid for ten
+   * minutes, bound to the redirect URI /login sends to Tesla. */
+  async beginSignIn(redirectUri: string): Promise<string> {
+    const state = newSignInState();
+    const now = this.clock();
+    const sql = this.ctx.storage.sql;
+    sql.exec("DELETE FROM sign_in_state WHERE expires_at <= ?", now);
+    sql.exec(
+      "DELETE FROM sign_in_state WHERE state NOT IN (SELECT state FROM sign_in_state ORDER BY expires_at DESC LIMIT ?)",
+      MAX_PENDING_SIGN_INS - 1,
+    );
+    sql.exec(
+      "INSERT INTO sign_in_state (state, redirect_uri, expires_at) VALUES (?, ?, ?)",
+      state,
+      redirectUri,
+      now + SIGN_IN_STATE_TTL_MS,
+    );
+    return state;
+  }
+
+  /** Finish a browser sign-in. The state is consumed first, whatever happens
+   * next. The code is exchanged with the redirect URI stored with the state,
+   * and the new tokens replace the stored ones through the token flight, as a
+   * refresh does. Once an account is signed in, only the same Tesla account
+   * (the access token's `sub`) can sign in again: /login is public. */
+  async completeSignIn(input: { state: string; code: string | null; error: string | null }): Promise<SignInResult> {
+    const pending = SIGN_IN_STATE_PATTERN.test(input.state)
+      ? this.ctx.storage.sql
+          .exec<{ redirect_uri: string; expires_at: number }>(
+            "DELETE FROM sign_in_state WHERE state = ? RETURNING redirect_uri, expires_at",
+            input.state,
+          )
+          .toArray()[0]
+      : undefined;
+    // Not audited: anyone can reach /callback, and the audit log is capped.
+    if (!pending || pending.expires_at <= this.clock()) return { ok: false, reason: "invalid_state" };
+    if (input.error || !input.code) return { ok: false, reason: "denied" };
+    try {
+      await this.tokenKey();
+      const { status, body } = await this.tokenRequest("browser_sign_in", {
+        grant_type: "authorization_code",
+        code: input.code,
+        redirect_uri: pending.redirect_uri,
+      });
+      const issued = status === 200 ? issuedTokens(body) : null;
+      if (!issued?.refreshToken) {
+        const errorCode = typeof body.error === "string" ? body.error : "";
+        console.error(`[tesla-mcp] browser sign-in: Tesla refused the code (http ${status} ${errorCode.slice(0, 32)})`);
+        return { ok: false, reason: "exchange_failed" };
+      }
+      const claims = accessTokenClaims(issued.accessToken);
+      const current = (await this.storedClaims()).sub;
+      if (current && current !== claims.sub) {
+        this.audit({
+          source: "system",
+          action: "browser_sign_in",
+          vehicleId: null,
+          outcome: "denied",
+          detail: "account_mismatch",
+        });
+        return { ok: false, reason: "account_mismatch" };
+      }
+      while (this.tokenFlight) await this.tokenFlight.catch(() => undefined);
+      const flight: Promise<string> = this.adoptSignIn(issued).finally(() => {
+        if (this.tokenFlight === flight) this.tokenFlight = null;
+      });
+      this.tokenFlight = flight;
+      await flight;
+      const scope = typeof body.scope === "string" ? body.scope : (claims.scopes ?? []).join(" ");
+      return { ok: true, scope: sanitizeScope(scope) };
+    } catch (error) {
+      if (error instanceof OwnerError && error.code === "not_configured")
+        return { ok: false, reason: "not_configured" };
+      return { ok: false, reason: "exchange_failed" };
+    }
+  }
+
+  /** Runs as the token flight. The bootstrap value set now counts as seeded:
+   * this sign-in supersedes it, and only a new value replaces it again. */
+  private async adoptSignIn(issued: IssuedTokens): Promise<string> {
+    const replaced = this.kvGet("tokens") !== null;
+    const bootstrap = this.env.TESLA_BOOTSTRAP_REFRESH_TOKEN?.trim();
+    const seed = bootstrap ? await fingerprint(bootstrap) : null;
+    await this.storeTokens(issued, null);
+    if (seed) this.kvSet("seed_fingerprint", seed);
+    this.kvDelete("auth_state");
+    this.vehicleCache = null;
+    this.siteCache = null;
+    this.audit({
+      source: "system",
+      action: "browser_sign_in",
+      vehicleId: null,
+      outcome: "ok",
+      detail: replaced ? "replaced stored tokens" : "initial sign-in",
+    });
+    return issued.accessToken;
+  }
+}
+
+/** Scope names only: Tesla's scope string, never anything else it sent. */
+function sanitizeScope(scope: string): string {
+  return scope
+    .split(/\s+/)
+    .filter((name) => /^[A-Za-z0-9_.:-]{1,64}$/.test(name))
+    .slice(0, 32)
+    .join(" ");
 }
 
 function forbidden(scopes: ScopeRequirement | undefined): OwnerFailure {
