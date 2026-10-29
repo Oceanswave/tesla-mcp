@@ -68,6 +68,7 @@ export type OwnerErrorCode =
   | "no_energy_sites"
   | "energy_site_id_required"
   | "energy_site_not_found"
+  | "not_found"
   | "command_failed";
 
 /** `reason` names the specific failure (pairing_required, wake_timeout,
@@ -758,8 +759,45 @@ export class OwnerState extends DurableObject<Env> {
           },
         };
       } catch (error) {
+        // A timeout, a 5xx, or an unreadable 200 can all come after Tesla
+        // acted on the request: for a change, the outcome is unknown, and the
+        // caller must check before repeating it (as for signed commands).
+        const unknownOutcome =
+          endpoint.mutates &&
+          error instanceof FleetError &&
+          (error.code === "bad_response" ||
+            (error.code === "upstream_error" && (error.status === null || error.status >= 500)));
         if (endpoint.mutates) {
-          this.audit({ source: "tool", action: name, vehicleId, outcome: "error", detail: this.errorDetail(error) });
+          this.audit({
+            source: "tool",
+            action: name,
+            vehicleId,
+            outcome: "error",
+            detail: unknownOutcome ? `status_unknown ${this.errorDetail(error)}` : this.errorDetail(error),
+          });
+        }
+        if (unknownOutcome) {
+          return {
+            ok: false,
+            error: {
+              code: "command_failed",
+              reason: "status_unknown",
+              message: "Tesla did not confirm the change. Check its current state before trying again.",
+            },
+          };
+        }
+        // The vehicle or site was already resolved against the account, so a
+        // 404 here is about the thing asked for (an expired invite, hardware
+        // the site lacks), not about which vehicle it is.
+        if (error instanceof FleetError && error.code === "not_found") {
+          return {
+            ok: false,
+            error: {
+              code: "not_found",
+              message:
+                "Tesla found nothing for this request (for example an expired invite, or hardware this product lacks).",
+            },
+          };
         }
         if (endpoint.target !== "vehicle" && error instanceof FleetError && error.code === "vehicle_unavailable") {
           return {
@@ -805,7 +843,7 @@ export class OwnerState extends DurableObject<Env> {
           outcome: "error",
           detail: `${code} ${stage}${reason ? ` ${reason}` : ""}`,
         });
-        return { ok: false as const, error: signedFailure(code, reason, signedCommandScopes(command)) };
+        return { ok: false as const, error: signedFailure(code, stage, reason, signedCommandScopes(command)) };
       } catch (error) {
         this.audit({ source: "tool", action: command, vehicleId, outcome: "error", detail: this.errorDetail(error) });
         return this.failure(error, signedCommandScopes(command));
@@ -847,7 +885,21 @@ function sanitizeCarReason(value: unknown): string {
   return typeof value === "string" && /^[A-Za-z0-9 _.,:'()/-]{1,80}$/.test(value) ? value : "unspecified";
 }
 
-function signedFailure(code: VcpErrorCode, carReason: string | undefined, scopes: ScopeRequirement): OwnerFailure {
+function signedFailure(
+  code: VcpErrorCode,
+  stage: string,
+  carReason: string | undefined,
+  scopes: ScopeRequirement,
+): OwnerFailure {
+  // The car answered, but stayed busy (WAIT/BUSY) through every retry; it
+  // reported that it did not run the command.
+  if (code === "vehicle_unavailable" && stage.endsWith("_exhausted")) {
+    return {
+      code: "tesla_unavailable",
+      reason: code,
+      message: "The car stayed busy and did not run the command. Try again shortly.",
+    };
+  }
   switch (code) {
     case "unauthorized":
       return { code: "reauth_required", reason: code, message: REAUTH_MESSAGE };

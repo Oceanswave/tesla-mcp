@@ -577,3 +577,72 @@ describe("account tools", () => {
     await client.close();
   });
 });
+
+describe("error reporting", () => {
+  it("reports a missing resource as not_found, not as a missing vehicle", async () => {
+    const tesla = new FakeTesla();
+    tesla.install();
+    tesla.fleetOverrides.push({ path: /\/invitations\/\d+\/revoke$/, status: 404 });
+    tesla.fleetOverrides.push({ path: /\/charger_live_status$/, status: 404 });
+    const { client } = await connect();
+    const revoke = (await client.callTool({
+      name: "tesla_vehicle_share_invite_revoke",
+      arguments: { invite_id: "7", confirm: true },
+    })) as ToolResult;
+    expect(revoke.structuredContent).toMatchObject({ error: "not_found" });
+    const charger = (await client.callTool({ name: "tesla_energy_charger_live_status", arguments: {} })) as ToolResult;
+    expect(charger.structuredContent).toMatchObject({ error: "not_found" });
+    await client.close();
+  });
+
+  it("reports a change Tesla may have applied as status_unknown, and a rejection as a rejection", async () => {
+    const tesla = new FakeTesla();
+    tesla.install();
+    const { client, owner } = await connect();
+    for (const status of [502, 504]) {
+      tesla.fleetOverrides.push({ path: /\/backup$/, status });
+      const result = (await client.callTool({
+        name: "tesla_energy_set_backup_reserve",
+        arguments: { percent: 30, confirm: true },
+      })) as ToolResult;
+      expect(result.structuredContent, String(status)).toMatchObject({
+        error: "command_failed",
+        reason: "status_unknown",
+      });
+      expect(String(result.structuredContent?.summary)).toMatch(/Check its current state before trying again/);
+    }
+    const [latest] = await owner.auditRecent(1);
+    expect(latest?.detail).toMatch(/^status_unknown /);
+
+    tesla.fleetOverrides.push({ path: /\/backup$/, status: 400 });
+    const rejected = (await client.callTool({
+      name: "tesla_energy_set_backup_reserve",
+      arguments: { percent: 30, confirm: true },
+    })) as ToolResult;
+    expect(rejected.structuredContent).toMatchObject({ error: "invalid_request" });
+
+    // A read that fails the same way is just unavailable: nothing changed.
+    tesla.fleetOverrides.push({ path: /\/live_status$/, status: 502 });
+    const read = (await client.callTool({ name: "tesla_energy_live_status", arguments: {} })) as ToolResult;
+    expect(read.structuredContent).toMatchObject({ error: "tesla_unavailable" });
+    await client.close();
+  });
+
+  it("says the car stayed busy, not asleep, when it never stops answering WAIT", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.behaviors = [
+      { kind: "fault", fault: 1 },
+      { kind: "fault", fault: 1 },
+      { kind: "fault", fault: 1 },
+    ];
+    tesla.install();
+    const { client } = await connect();
+    await runInDurableObject(env.TESLA_VCP.get(env.TESLA_VCP.idFromName(tesla.vin)), (instance) => {
+      instance.sleep = async () => {};
+    });
+    const result = (await client.callTool({ name: "tesla_flash_lights", arguments: { confirm: true } })) as ToolResult;
+    expect(result.structuredContent).toMatchObject({ error: "tesla_unavailable", reason: "vehicle_unavailable" });
+    expect(String(result.structuredContent?.summary)).toMatch(/stayed busy/);
+    await client.close();
+  });
+});
