@@ -1,5 +1,5 @@
 name: PR auto-merge (green CI)
-# Sean's rule: if a PR passes CI, merge it. Calls the shared merge helper after
+# Repository rule: if a PR passes CI, merge it. Calls the shared merge helper after
 # CI completes on a same-repo pull request; the helper re-checks reviews, holds
 # (draft, requested review, unresolved threads, changes requested), and that every
 # check on the exact head is green before squash-merging. Self-hosted runner only.
@@ -25,4 +25,4 @@ jobs:
       runs-on: '["self-hosted","Linux","X64","tesla-mcp"]'
       head-branch: ${{ github.event.workflow_run.head_branch }}
       expected-head: ${{ github.event.workflow_run.head_sha }}
-      required-checks: '[{"name":"verify","appId":15368}]'
+      required-checks: '[{"name":"verify","appId":15368},{"name":"secret-scan","appId":15368},{"name":"go-conformance","appId":15368},{"name":"deploy-dry-run / Wrangler deploy","appId":15368}]'

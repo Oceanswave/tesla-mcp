@@ -1,6 +1,6 @@
 // OwnerState: one Durable Object per owner. Holds the encrypted Tesla tokens,
-// the audit log, the nightly-lock alarm, and the serialized vehicle-command
-// lane. Everything that talks to Tesla on the owner's behalf goes through here.
+// the audit log, and the serialized vehicle-command lane. Everything that
+// talks to Tesla on the owner's behalf goes through here.
 
 import { DurableObject } from "cloudflare:workers";
 import { bytesToHex, sha256 } from "../bytes";
@@ -8,22 +8,7 @@ import type { Env } from "../env";
 import { FleetClient, FleetError, summarizeVehicleData, type VehicleSummary } from "../tesla/fleet";
 import { defaultFetch, type FetchFn, fetchUpstream, readBoundedText } from "../tesla/http";
 import type { SignedCommandResult } from "../tesla/vcp/session";
-import {
-  INTERACTIVE_LOCK_POLICY,
-  type LockOptions,
-  type LockOutcome,
-  type LockPolicy,
-  lockWithRetry,
-  NIGHTLY_LOCK_POLICY,
-} from "./lock";
-import {
-  computeLatestRun,
-  computeNextRun,
-  localDateString,
-  localParts,
-  parseLocalTime,
-  validTimeZone,
-} from "./schedule";
+import { LOCK_POLICY, type LockFailureCode, type LockOutcome, lockWithRetry } from "./lock";
 import { decryptTokens, encryptTokens, importTokenKey, type StoredTokens } from "./tokens";
 
 const REFRESH_MARGIN_MS = 5 * 60_000;
@@ -31,22 +16,16 @@ const TOKEN_TIMEOUT_MS = 15_000;
 const MAX_TOKEN_BODY_BYTES = 32_768;
 const AUDIT_KEEP_ROWS = 1000;
 const VEHICLE_CACHE_MS = 5 * 60_000;
-/** A nightly alarm that fires this late (platform outage) is skipped rather
- * than locking the car at an unexpected hour. */
-const MISSED_WINDOW_MS = 3 * 60 * 60_000;
-/** Runs of one night's lock, including the first: an instance evicted or
- * failing mid-run is resumed at most three times so a crash loop cannot
- * spam the car. */
-const MAX_NIGHTLY_RUNS = 4;
 
-/** Durable record of the current night's run. "pending" is written before
- * any Tesla call and "done" only after the outcome is recorded, so a retried
- * alarm resumes an interrupted run and never repeats a finished one. */
-type NightlyRun = { localDate: string; status: "pending" | "done"; attempts: number; startedAt: string };
+/** The one-step fix for a rejected Tesla sign-in, shown to callers. */
+const REAUTH_MESSAGE =
+  "Tesla sign-in has expired or was revoked. Get a new Tesla refresh token and set it with " +
+  "`npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`; the next request uses it.";
+const NOT_CONNECTED_MESSAGE = "No Tesla account is connected yet.";
 
 export type LockSuccess = Extract<LockOutcome, { ok: true }> & { vehicleId: string };
 
-export type AuditSource = "tool" | "alarm" | "system";
+export type AuditSource = "tool" | "system";
 export type AuditOutcome = "ok" | "error" | "denied";
 
 export type AuditRow = {
@@ -70,7 +49,11 @@ export type OwnerErrorCode =
   | "rate_limited"
   | "command_failed";
 
-export type OwnerResult<T> = { ok: true; data: T } | { ok: false; error: { code: OwnerErrorCode; message: string } };
+/** `reason` names the specific lock failure (pairing_required, wake_timeout,
+ * still_unlocked, ...) so a caller can act on it without parsing prose. */
+export type OwnerFailure = { code: OwnerErrorCode; message: string; reason?: LockFailureCode };
+
+export type OwnerResult<T> = { ok: true; data: T } | { ok: false; error: OwnerFailure };
 
 class OwnerError extends Error {
   constructor(
@@ -95,20 +78,11 @@ async function fingerprint(value: string): Promise<string> {
   return bytesToHex(await sha256(new TextEncoder().encode(`tesla-mcp:seed:v1:${value}`))).slice(0, 32);
 }
 
-type NightlyConfig =
-  | { enabled: false; time: string; timeZone: string; error: string | null }
-  | { enabled: true; time: string; timeZone: string; error: null };
+/** "ok": Tesla has not rejected the current sign-in. "reauth_required": it
+ * did; set a new bootstrap refresh token. "not_configured": no account yet. */
+export type AuthState = "ok" | "reauth_required" | "not_configured";
 
-export type NightlyLockStatus = {
-  enabled: boolean;
-  configError: string | null;
-  time: string;
-  timeZone: string;
-  localNow: string;
-  nextRun: { at: string; local: string } | null;
-  lastRun: { at: string; localDate: string; outcome: AuditOutcome; detail: string } | null;
-  authState: "ok" | "reauth_required";
-};
+export type AuthStatus = { authState: AuthState; message: string | null };
 
 export class OwnerState extends DurableObject<Env> {
   /** Injection points for tests. Production uses the real clock and timers. */
@@ -121,8 +95,6 @@ export class OwnerState extends DurableObject<Env> {
   private refreshCount = 0;
   private lane: Promise<unknown> = Promise.resolve();
   private vehicleCache: { at: number; vehicles: VehicleSummary[] } | null = null;
-  /** Set while this instance runs the nightly lock; lost on eviction. */
-  private nightlyInFlight = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -137,6 +109,9 @@ export class OwnerState extends DurableObject<Env> {
         outcome TEXT NOT NULL,
         detail TEXT NOT NULL
       )`);
+      // Left behind by the removed built-in nightly lock: its alarm and keys.
+      await ctx.storage.deleteAlarm();
+      ctx.storage.sql.exec("DELETE FROM kv WHERE key IN ('nightly_run', 'last_run', 'scheduled_for')");
     });
   }
 
@@ -215,27 +190,24 @@ export class OwnerState extends DurableObject<Env> {
     }
   }
 
-  /** Load stored tokens, seeding from TESLA_BOOTSTRAP_REFRESH_TOKEN only when
-   * nothing is stored yet, or when Tesla rejected the stored refresh token and
-   * the owner has since provided a different bootstrap token. Runs only inside
-   * the token flight (see getAccessToken). */
+  /** Load stored tokens. A TESLA_BOOTSTRAP_REFRESH_TOKEN value that has not
+   * been seeded before replaces whatever is stored, whatever the auth state:
+   * setting a new value is how the owner signs in again. The same value is
+   * never seeded twice, so the rotated tokens Tesla issues are kept. Runs only
+   * inside the token flight (see getAccessToken). */
   private async loadTokens(): Promise<StoredTokens> {
     const key = await this.tokenKey();
     const blob = this.kvGet("tokens");
     const bootstrap = this.env.TESLA_BOOTSTRAP_REFRESH_TOKEN?.trim();
     const reauth = this.kvGet("auth_state") === "reauth_required";
-    if (bootstrap && (!blob || reauth)) {
+    if (bootstrap) {
       const seed = await fingerprint(bootstrap);
       if (this.kvGet("seed_fingerprint") !== seed) {
         const seeded: StoredTokens = { accessToken: null, refreshToken: bootstrap, expiresAt: 0 };
         const encrypted = await encryptTokens(key, seeded);
-        // Compare-and-set: write only over exactly the state read above, so a
-        // seed can never replace tokens rotated in the meantime.
-        if (
-          this.kvGet("tokens") !== blob ||
-          this.kvGet("seed_fingerprint") === seed ||
-          (this.kvGet("auth_state") === "reauth_required") !== reauth
-        ) {
+        // Compare-and-set across the await above: if another flight changed
+        // the token state meanwhile, start over from what is stored now.
+        if (this.kvGet("tokens") !== blob || this.kvGet("seed_fingerprint") === seed) {
           return this.loadTokens();
         }
         this.kvSet("tokens", encrypted);
@@ -246,18 +218,13 @@ export class OwnerState extends DurableObject<Env> {
           action: "tokens_seeded",
           vehicleId: null,
           outcome: "ok",
-          detail: reauth ? "replaced rejected refresh token" : "initial seed",
+          detail: !blob ? "initial seed" : reauth ? "replaced rejected refresh token" : "replaced stored tokens",
         });
         return seeded;
       }
     }
-    if (reauth) {
-      throw new OwnerError(
-        "reauth_required",
-        "Tesla sign-in has expired. The owner needs to provide a new refresh token.",
-      );
-    }
-    if (!blob) throw new OwnerError("not_configured", "No Tesla account is connected yet.");
+    if (reauth) throw new OwnerError("reauth_required", REAUTH_MESSAGE);
+    if (!blob) throw new OwnerError("not_configured", NOT_CONNECTED_MESSAGE);
     try {
       return await decryptTokens(key, blob);
     } catch {
@@ -296,7 +263,7 @@ export class OwnerState extends DurableObject<Env> {
   private async refresh(tokens: StoredTokens): Promise<string> {
     const clientId = this.env.TESLA_CLIENT_ID;
     if (!clientId) throw new OwnerError("not_configured", "TESLA_CLIENT_ID is not configured.");
-    // Same form the owner's Python plugin sends (client.refresh_access_token).
+    // Same form hermes-tescmd-plugin sends (client.refresh_access_token).
     const form = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: tokens.refreshToken,
@@ -351,10 +318,8 @@ export class OwnerState extends DurableObject<Env> {
         outcome: "error",
         detail: `reauth_required ${response.status} ${errorCode.slice(0, 32)}`,
       });
-      throw new OwnerError(
-        "reauth_required",
-        "Tesla sign-in has expired. The owner needs to provide a new refresh token.",
-      );
+      console.error(`[tesla-mcp] reauth_required: Tesla rejected the refresh token (http ${response.status})`);
+      throw new OwnerError("reauth_required", REAUTH_MESSAGE);
     }
     const accessToken = body.access_token;
     if (response.status !== 200 || typeof accessToken !== "string" || !accessToken) {
@@ -396,7 +361,8 @@ export class OwnerState extends DurableObject<Env> {
       return await call(await this.getAccessToken(true));
     } catch (error) {
       if (error instanceof FleetError && error.code === "unauthorized") {
-        throw new OwnerError("reauth_required", "Tesla rejected the account token. The owner needs to sign in again.");
+        console.error("[tesla-mcp] reauth_required: Fleet API rejected a freshly refreshed token");
+        throw new OwnerError("reauth_required", REAUTH_MESSAGE);
       }
       throw error;
     }
@@ -448,7 +414,7 @@ export class OwnerState extends DurableObject<Env> {
     return run;
   }
 
-  private failure(error: unknown): { ok: false; error: { code: OwnerErrorCode; message: string } } {
+  private failure(error: unknown): { ok: false; error: OwnerFailure } {
     if (error instanceof OwnerError) return { ok: false, error: { code: error.code, message: error.message } };
     if (error instanceof FleetError) {
       if (error.code === "rate_limited") {
@@ -530,17 +496,13 @@ export class OwnerState extends DurableObject<Env> {
     });
   }
 
+  /** Lock the car: wake it if needed, poll until online, retry, and read the
+   * lock state back. The same policy serves every caller. */
   async lock(input: { vehicleId?: string }): Promise<OwnerResult<LockSuccess>> {
-    return this.inLane(() => this.lockFlow("tool", input.vehicleId, INTERACTIVE_LOCK_POLICY));
+    return this.inLane(() => this.lockFlow(input.vehicleId));
   }
 
-  private async lockFlow(
-    source: AuditSource,
-    vehicleId: string | undefined,
-    policy: LockPolicy,
-    rethrowUnexpected = false,
-    options: LockOptions = {},
-  ): Promise<OwnerResult<LockSuccess>> {
+  private async lockFlow(vehicleId: string | undefined): Promise<OwnerResult<LockSuccess>> {
     let resolvedId: string | null = vehicleId ?? null;
     try {
       const vehicle = await this.resolveVehicle(vehicleId);
@@ -589,236 +551,51 @@ export class OwnerState extends DurableObject<Env> {
           sleep: (milliseconds) => this.sleep(milliseconds),
           now: () => this.clock(),
         },
-        policy,
-        options,
+        LOCK_POLICY,
+        { confirmLocked: true },
       );
-      const detail = `${outcome.ok ? outcome.detail : `${outcome.code} ${outcome.detail}`} attempts=${outcome.attempts}${outcome.woke ? " woke" : ""}`;
-      this.audit({ source, action: "lock", vehicleId: vehicle.id, outcome: outcome.ok ? "ok" : "error", detail });
-      if (outcome.ok) return { ok: true, data: { ...outcome, vehicleId: vehicle.id } };
-      return { ok: false, error: { code: "command_failed", message: lockFailureMessage(outcome) } };
-    } catch (error) {
-      // Anything that is not a Tesla or owner error (a lost Durable Object
-      // call, a reset) interrupted the run; the nightly alarm resumes it.
-      const interrupted = rethrowUnexpected && !(error instanceof OwnerError || error instanceof FleetError);
+      const detail = `${outcome.ok ? outcome.detail : `${outcome.code} ${outcome.detail}`} attempts=${outcome.attempts}${outcome.woke ? " woke" : ""}${outcome.ok && outcome.confirmed ? " confirmed" : ""}`;
       this.audit({
-        source,
+        source: "tool",
+        action: "lock",
+        vehicleId: vehicle.id,
+        outcome: outcome.ok ? "ok" : "error",
+        detail,
+      });
+      if (outcome.ok) return { ok: true, data: { ...outcome, vehicleId: vehicle.id } };
+      // A signed command Tesla still refuses after a forced token refresh
+      // means the account's sign-in is no longer accepted.
+      const code: OwnerErrorCode = outcome.code === "unauthorized" ? "reauth_required" : "command_failed";
+      const message = code === "reauth_required" ? REAUTH_MESSAGE : lockFailureMessage(outcome);
+      return { ok: false, error: { code, message, reason: outcome.code } };
+    } catch (error) {
+      this.audit({
+        source: "tool",
         action: "lock",
         vehicleId: resolvedId,
         outcome: "error",
-        detail: interrupted ? "interrupted" : this.errorDetail(error),
+        detail: this.errorDetail(error),
       });
-      if (interrupted) throw error;
       return this.failure(error);
     }
   }
 
   // ---------------------------------------------------------------------------
-  // Nightly lock
+  // Sign-in state
   // ---------------------------------------------------------------------------
 
-  private nightlyConfig(): NightlyConfig {
-    const time = this.env.NIGHTLY_LOCK_TIME;
-    const timeZone = this.env.NIGHTLY_LOCK_TIMEZONE;
-    if (this.env.NIGHTLY_LOCK_ENABLED !== "true") return { enabled: false, time, timeZone, error: null };
-    if (!parseLocalTime(time)) return { enabled: false, time, timeZone, error: "NIGHTLY_LOCK_TIME must be HH:MM" };
-    if (!validTimeZone(timeZone)) {
-      return { enabled: false, time, timeZone, error: "NIGHTLY_LOCK_TIMEZONE is not a valid IANA time zone" };
-    }
-    return { enabled: true, time, timeZone, error: null };
+  /** Sign-in state from storage alone: never calls Tesla or wakes a car. A
+   * bootstrap token that has not been seeded yet counts as "ok", because the
+   * next request signs in with it (see loadTokens). */
+  async authStatus(): Promise<AuthStatus> {
+    const bootstrap = this.env.TESLA_BOOTSTRAP_REFRESH_TOKEN?.trim();
+    const newBootstrap = bootstrap ? this.kvGet("seed_fingerprint") !== (await fingerprint(bootstrap)) : false;
+    if (newBootstrap) return { authState: "ok", message: null };
+    if (this.kvGet("auth_state") === "reauth_required")
+      return { authState: "reauth_required", message: REAUTH_MESSAGE };
+    if (!this.kvGet("tokens")) return { authState: "not_configured", message: NOT_CONNECTED_MESSAGE };
+    return { authState: "ok", message: null };
   }
-
-  /** Idempotent: set the alarm to the next nightly run unless it already is.
-   * Called by the cron trigger every 15 minutes and after each run. A run that
-   * is due but not yet done (never started, or pending after an interruption)
-   * is never moved: its alarm may be delivered (or retried) after a cron tick,
-   * and alarm() runs or resumes it late, or audits it missed. */
-  async ensureAlarm(): Promise<{ nextRun: string | null }> {
-    const config = this.nightlyConfig();
-    if (!config.enabled) {
-      await this.ctx.storage.deleteAlarm();
-      this.kvDelete("scheduled_for");
-      return { nextRun: null };
-    }
-    const now = this.clock();
-    const scheduled = Number(this.kvGet("scheduled_for") ?? Number.NaN);
-    if (
-      Number.isFinite(scheduled) &&
-      scheduled <= now &&
-      !this.nightlyDone(localDateString(scheduled, config.timeZone))
-    ) {
-      if ((await this.ctx.storage.getAlarm()) !== scheduled) await this.ctx.storage.setAlarm(scheduled);
-      return { nextRun: new Date(scheduled).toISOString() };
-    }
-    let next = computeNextRun(new Date(now), config.time, config.timeZone).getTime();
-    if (Number.isFinite(scheduled)) {
-      // Catch up after an outage: when the last scheduled run is older than
-      // the latest due one (say yesterday's alarm was only delivered tonight
-      // at 22:30 and audited as missed), run tonight's now if it is still
-      // within the window instead of skipping to tomorrow. Never on first
-      // deploy (nothing scheduled yet), so deploying late does not lock.
-      const latest = computeLatestRun(new Date(now), config.time, config.timeZone).getTime();
-      if (
-        latest > scheduled &&
-        now - latest <= MISSED_WINDOW_MS &&
-        !this.nightlyDone(localDateString(latest, config.timeZone))
-      ) {
-        next = latest;
-      }
-    }
-    if ((await this.ctx.storage.getAlarm()) !== next) {
-      await this.ctx.storage.setAlarm(next);
-    }
-    this.kvSet("scheduled_for", String(next));
-    return { nextRun: new Date(next).toISOString() };
-  }
-
-  override async alarm(): Promise<void> {
-    const config = this.nightlyConfig();
-    if (!config.enabled) {
-      this.kvDelete("scheduled_for");
-      return;
-    }
-    // A delivery while this instance is still running tonight's lock (the
-    // cron keeps a pending run armed) must not start a second run.
-    if (this.nightlyInFlight) return;
-    const now = this.clock();
-    const scheduledFor = Number(this.kvGet("scheduled_for") ?? Number.NaN);
-    const target = Number.isFinite(scheduledFor) ? scheduledFor : now;
-    if (now < target - 60_000) {
-      // Stale alarm from an older schedule; re-arm for the real time.
-      await this.ensureAlarm();
-      return;
-    }
-    const runDate = localDateString(target, config.timeZone);
-    const previous = this.nightlyRun();
-    if (previous?.localDate === runDate && previous.status === "done") {
-      await this.ensureAlarm();
-      return;
-    }
-    const resumed = previous?.localDate === runDate ? previous : null;
-    const run: NightlyRun = {
-      localDate: runDate,
-      status: "pending",
-      attempts: (resumed?.attempts ?? 0) + 1,
-      startedAt: resumed?.startedAt ?? new Date(now).toISOString(),
-    };
-    if (now - target > MISSED_WINDOW_MS) {
-      this.finishNightly(
-        { ...run, attempts: resumed?.attempts ?? 0 },
-        "error",
-        resumed ? "skipped: interrupted run not finished in time" : "skipped: alarm fired too late",
-      );
-      this.audit({
-        source: "alarm",
-        action: "nightly_lock",
-        vehicleId: null,
-        outcome: "error",
-        detail: resumed ? "missed after interruption" : "missed",
-      });
-      await this.ensureAlarm();
-      return;
-    }
-    if (run.attempts > MAX_NIGHTLY_RUNS) {
-      this.finishNightly({ ...run, attempts: MAX_NIGHTLY_RUNS }, "error", "abandoned: run interrupted too often");
-      this.audit({
-        source: "alarm",
-        action: "nightly_lock",
-        vehicleId: null,
-        outcome: "error",
-        detail: `abandoned runs=${MAX_NIGHTLY_RUNS}`,
-      });
-      await this.ensureAlarm();
-      return;
-    }
-    // Persist the pending run before any Tesla call: if this instance is
-    // evicted or fails mid-run, Cloudflare retries the alarm (and the cron
-    // keeps it armed), and the next delivery resumes tonight's run.
-    this.kvSet("nightly_run", JSON.stringify(run));
-    if (resumed) {
-      this.audit({
-        source: "alarm",
-        action: "nightly_lock",
-        vehicleId: null,
-        outcome: "ok",
-        detail: `resumed run=${run.attempts}`,
-      });
-    }
-    let result: OwnerResult<LockSuccess>;
-    this.nightlyInFlight = true;
-    try {
-      // An unexpected error propagates and leaves the run pending.
-      // A resumed run may have locked the car before it was interrupted.
-      result = await this.inLane(() =>
-        this.lockFlow("alarm", undefined, NIGHTLY_LOCK_POLICY, true, { checkLockedFirst: resumed !== null }),
-      );
-    } finally {
-      this.nightlyInFlight = false;
-    }
-    if (result.ok) {
-      this.finishNightly(
-        run,
-        "ok",
-        result.data.detail === "locked_after_wake" ? "lock command succeeded after waking" : result.data.detail,
-      );
-    } else {
-      this.finishNightly(run, "error", result.error.code);
-    }
-    await this.ensureAlarm();
-  }
-
-  private nightlyRun(): NightlyRun | null {
-    const raw = this.kvGet("nightly_run");
-    return raw ? (JSON.parse(raw) as NightlyRun) : null;
-  }
-
-  private nightlyDone(localDate: string): boolean {
-    const run = this.nightlyRun();
-    return run?.localDate === localDate && run.status === "done";
-  }
-
-  /** Record the outcome and mark the night done in one synchronous step. */
-  private finishNightly(run: NightlyRun, outcome: AuditOutcome, detail: string): void {
-    this.recordLastRun(run.localDate, outcome, detail);
-    this.kvSet("nightly_run", JSON.stringify({ ...run, status: "done" }));
-  }
-
-  private recordLastRun(localDate: string, outcome: AuditOutcome, detail: string): void {
-    this.kvSet(
-      "last_run",
-      JSON.stringify({ at: new Date(this.clock()).toISOString(), localDate, outcome, detail: redactDetail(detail) }),
-    );
-  }
-
-  async nightlyLockStatus(): Promise<NightlyLockStatus> {
-    const config = this.nightlyConfig();
-    const now = this.clock();
-    // Report the alarm actually armed, not a computed time: right after a
-    // deploy nothing is armed until the first cron tick calls ensureAlarm.
-    const armed = await this.ctx.storage.getAlarm();
-    let nextRun: NightlyLockStatus["nextRun"] = null;
-    let localNow = new Date(now).toISOString();
-    if (config.enabled) {
-      if (armed !== null) nextRun = { at: new Date(armed).toISOString(), local: formatLocal(armed, config.timeZone) };
-      localNow = formatLocal(now, config.timeZone);
-    }
-    const lastRaw = this.kvGet("last_run");
-    return {
-      enabled: config.enabled,
-      configError: config.error,
-      time: config.time,
-      timeZone: config.timeZone,
-      localNow,
-      nextRun,
-      lastRun: lastRaw ? (JSON.parse(lastRaw) as NightlyLockStatus["lastRun"]) : null,
-      authState: this.kvGet("auth_state") === "reauth_required" ? "reauth_required" : "ok",
-    };
-  }
-}
-
-function formatLocal(instant: number, timeZone: string): string {
-  const p = localParts(instant, timeZone);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${p.year}-${pad(p.month)}-${pad(p.day)} ${pad(p.hour)}:${pad(p.minute)} ${timeZone}`;
 }
 
 function lockFailureMessage(outcome: Extract<LockOutcome, { ok: false }>): string {
@@ -839,6 +616,8 @@ function lockFailureMessage(outcome: Extract<LockOutcome, { ok: false }>): strin
       return `The car did not respond after ${outcome.attempts} tries. It may be out of coverage.`;
     case "status_unknown":
       return "Tesla did not confirm the lock. Check the car before trying again.";
+    case "still_unlocked":
+      return "Tesla accepted the lock, but the car still reports unlocked. A door, trunk, or frunk may be open.";
     default:
       return `The lock did not go through after ${outcome.attempts} tries.`;
   }

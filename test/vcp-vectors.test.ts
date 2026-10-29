@@ -1,5 +1,5 @@
 // Cross-language vectors: the TypeScript signer must produce exactly the bytes
-// the owner's production Python plugin produces for a VCSEC lock (regenerate
+// the hermes-tescmd-plugin Python implementation produces for a VCSEC lock (regenerate
 // with scripts/vcsec_vectors.py) and the bytes in test/vectors/vcsec-lock.json,
 // which conformance/run.sh checks against Tesla's official Go implementation.
 // The keys are the private scalars 1 (client) and 2 (vehicle), assembled here

@@ -26,19 +26,20 @@ export type LockPolicy = {
   budgetMs: number;
 };
 
-// A Durable Object alarm handler is cut off after 15 minutes of wall time.
-// Seven minutes leaves room for one more signed command already in flight
-// (handshake and command retries can take about five minutes when every
-// Tesla call times out) plus the lock-state check after it.
-export const NIGHTLY_LOCK_POLICY: LockPolicy = { maxAttempts: 4, wakeTimeoutMs: 90_000, budgetMs: 7 * 60_000 };
-// MCP clients time out long tool calls; keep an interactive lock shorter.
-export const INTERACTIVE_LOCK_POLICY: LockPolicy = { maxAttempts: 2, wakeTimeoutMs: 45_000, budgetMs: 2 * 60_000 };
+// One policy for every lock, whoever calls it. Seven minutes bounds a single
+// tool call: a caller that waits on tesla_lock (a person, an assistant, or a
+// scheduled routine) gets an answer, and one more signed command already in
+// flight (handshake and command retries can take about five minutes when every
+// Tesla call times out) plus the lock-state check after it can still finish.
+export const LOCK_POLICY: LockPolicy = { maxAttempts: 4, wakeTimeoutMs: 90_000, budgetMs: 7 * 60_000 };
 
 export type LockOptions = {
-  /** Check vehicle_state.locked before sending: a resumed run may already
-   * have locked the car before it was interrupted. */
-  checkLockedFirst?: boolean;
+  /** After Tesla accepts the lock, read vehicle_state.locked back. A car that
+   * still reports unlocked gets another attempt. */
+  confirmLocked?: boolean;
 };
+
+export type LockFailureCode = VcpErrorCode | "wake_timeout" | "still_unlocked";
 
 export type LockOutcome =
   | {
@@ -46,8 +47,10 @@ export type LockOutcome =
       detail: "locked" | "locked_after_wake" | "already_locked";
       attempts: number;
       woke: boolean;
+      /** True when the car itself reported locked, not just Tesla's reply. */
+      confirmed: boolean;
     }
-  | { ok: false; code: VcpErrorCode | "wake_timeout"; detail: string; attempts: number; woke: boolean };
+  | { ok: false; code: LockFailureCode; detail: string; attempts: number; woke: boolean };
 
 /** Faults a retry cannot fix; stop immediately instead of hammering Tesla. */
 const FATAL = new Set<VcpErrorCode>([
@@ -97,6 +100,20 @@ async function pollLocked(deps: LockDeps): Promise<boolean | null> {
   return locked;
 }
 
+/** Read the lock state back after Tesla accepted a lock. The state can lag
+ * the command by a moment, so poll a few times until it reads locked. Never
+ * throws: the lock already went through, only the confirmation is missing. */
+async function readBackLocked(deps: LockDeps): Promise<boolean | null> {
+  const read = () => deps.isLocked().catch(() => null);
+  let locked = await read();
+  for (const delay of STATUS_POLL_DELAYS) {
+    if (locked === true) break;
+    await deps.sleep(delay);
+    locked = await read();
+  }
+  return locked;
+}
+
 export async function lockWithRetry(
   deps: LockDeps,
   policy: LockPolicy,
@@ -104,51 +121,52 @@ export async function lockWithRetry(
 ): Promise<LockOutcome> {
   const deadline = deps.now() + policy.budgetMs;
   let woke = false;
-  let online = true;
-  let lastCode: VcpErrorCode | "wake_timeout" = "vehicle_unavailable";
+  let lastCode: LockFailureCode = "vehicle_unavailable";
   let lastDetail = "not_attempted";
 
   if ((await deps.getState()) !== "online") {
     woke = true;
-    online = await wakeAndWait(deps, policy.wakeTimeoutMs, deadline);
-    if (!online) {
+    if (!(await wakeAndWait(deps, policy.wakeTimeoutMs, deadline))) {
       lastCode = "wake_timeout";
       lastDetail = "vehicle did not come online after wake";
     }
   }
-  if (options.checkLockedFirst && online && (await deps.isLocked()) === true) {
-    return { ok: true, detail: "already_locked", attempts: 0, woke };
-  }
-
   // The first attempt always runs; later ones only start within the budget.
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
     if (attempt > 1 && deps.now() >= deadline) {
       return { ok: false, code: lastCode, detail: `${lastDetail} time_budget_exhausted`, attempts: attempt - 1, woke };
     }
     const result = await deps.sendLock();
+    const locked = woke ? "locked_after_wake" : "locked";
+    let code: LockFailureCode;
     if (result.ok) {
-      return { ok: true, detail: woke ? "locked_after_wake" : "locked", attempts: attempt, woke };
-    }
-    const { code, stage } = result.error;
-    lastCode = code;
-    lastDetail = stage;
-    if (FATAL.has(code)) return { ok: false, code, detail: stage, attempts: attempt, woke };
-
-    if (code === "status_unknown") {
-      // The response was lost, so the lock may have run. Never resend while
-      // the outcome is still unknown; only a car that reports itself unlocked
-      // gets another attempt.
-      const locked = await pollLocked(deps);
-      if (locked === true) {
-        return { ok: true, detail: woke ? "locked_after_wake" : "locked", attempts: attempt, woke };
-      }
-      if (locked === null) return { ok: false, code, detail: stage, attempts: attempt, woke };
+      const state = options.confirmLocked ? await readBackLocked(deps) : null;
+      if (state !== false) return { ok: true, detail: locked, attempts: attempt, woke, confirmed: state === true };
+      // Tesla accepted the command but the car still reports unlocked.
+      code = "still_unlocked";
+      lastCode = code;
+      lastDetail = "unlocked_after_lock";
     } else {
-      if (code === "command_rejected" && (await deps.isLocked()) === true) {
-        // The car refuses to lock because it already is.
-        return { ok: true, detail: "already_locked", attempts: attempt, woke };
+      const { stage } = result.error;
+      code = result.error.code;
+      lastCode = code;
+      lastDetail = stage;
+      if (FATAL.has(result.error.code)) return { ok: false, code, detail: stage, attempts: attempt, woke };
+
+      if (code === "status_unknown") {
+        // The response was lost, so the lock may have run. Never resend while
+        // the outcome is still unknown; only a car that reports itself
+        // unlocked gets another attempt.
+        const state = await pollLocked(deps);
+        if (state === true) return { ok: true, detail: locked, attempts: attempt, woke, confirmed: true };
+        if (state === null) return { ok: false, code, detail: stage, attempts: attempt, woke };
+      } else {
+        if (code === "command_rejected" && (await deps.isLocked()) === true) {
+          // The car refuses to lock because it already is.
+          return { ok: true, detail: "already_locked", attempts: attempt, woke, confirmed: true };
+        }
+        if (!result.error.retryable) return { ok: false, code, detail: stage, attempts: attempt, woke };
       }
-      if (!result.error.retryable) return { ok: false, code, detail: stage, attempts: attempt, woke };
     }
     if (attempt === policy.maxAttempts) break;
     if (deps.now() >= deadline) {

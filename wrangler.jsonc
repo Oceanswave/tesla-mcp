@@ -4,16 +4,15 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-08-01",
   "compatibility_flags": ["nodejs_compat"],
-  // No routes or custom domain in the repo. The owner's deployment attaches
-  // tesla-mcp.baristalabs.io as a custom domain at deploy time; self-hosters
-  // use their own domain (Tesla requires the public key on a domain you own).
+  // No routes or custom domain in the repo: attach your own domain at deploy
+  // time (Tesla requires the public key on a domain you own).
   "workers_dev": true,
   "preview_urls": false,
   "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
-      // One OwnerState per owner: encrypted Tesla tokens, audit log, nightly
-      // lock alarm, and the serialized vehicle-command lane.
+      // One OwnerState per owner: encrypted Tesla tokens, audit log, and the
+      // serialized vehicle-command lane.
       { "name": "OWNER", "class_name": "OwnerState" },
       // One TeslaVcpSession per VIN: Vehicle Command Protocol sessions keyed
       // by (VIN, domain). Session keys live in memory only.
@@ -21,11 +20,6 @@
     ]
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OwnerState", "TeslaVcpSession"] }],
-  "triggers": {
-    // The cron only re-arms the OwnerState alarm (idempotent). The nightly
-    // lock itself runs from the Durable Object alarm at the exact local time.
-    "crons": ["*/15 * * * *"]
-  },
   // Non-secret configuration. Secrets are listed in .dev.vars.example and set
   // with `wrangler secret put`.
   "vars": {
@@ -34,9 +28,6 @@
     // Public by definition: Tesla fetches it from
     // /.well-known/appspecific/com.tesla.3p.public-key.pem.
     "TESLA_PUBLIC_KEY_PEM": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEzU4sPRPe2N2yXYwhSgMjPAVW6Voq\nfHxe3wguACnHbh7buD93WNbnVSvCcPyCBtYRoj3m4MEoOlKtMah7cKH2OQ==\n-----END PUBLIC KEY-----\n",
-    "NIGHTLY_LOCK_ENABLED": "true",
-    "NIGHTLY_LOCK_TIME": "22:00",
-    "NIGHTLY_LOCK_TIMEZONE": "America/New_York",
     "DANGEROUS_COMMANDS_ENABLED": "false"
   }
 }

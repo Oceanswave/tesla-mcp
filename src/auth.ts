@@ -1,4 +1,4 @@
-// Authentication for /mcp behind a small interface, so PR 2 can swap the
+// Authentication for /mcp behind a small interface, so a later change can swap the
 // static bearer token for an OAuth provider chained to Tesla sign-in.
 
 import { constantTimeEqual, sha256 } from "./bytes";

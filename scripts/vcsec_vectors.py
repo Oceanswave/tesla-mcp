@@ -1,6 +1,6 @@
 """Generate the VCSEC lock test vectors in test/vcp-vectors.test.ts.
 
-Runs the owner's production Python plugin (hermes-tescmd-plugin, MIT) with
+Runs the hermes-tescmd-plugin Python implementation (MIT) with
 fixed inputs so the TypeScript signer can be checked byte for byte against it.
 The client and vehicle keys are the private scalars 1 and 2 (public points G
 and 2G): deliberately worthless, and derived here rather than stored.

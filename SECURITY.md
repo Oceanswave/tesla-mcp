@@ -26,7 +26,8 @@ vehicle-command private key, and control of the car.
 
 Known limitations of the MVP: a single static bearer token (no per-user identity); VCSEC replies are not encrypted
 by the vehicle, so the lock result is reported as Tesla returns it; if a token refresh response is lost in transit
-after Tesla rotated the refresh token, the owner must provide a new bootstrap token.
+after Tesla rotated the refresh token, the owner must provide a new bootstrap token (one step:
+`npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`; any value not seeded before replaces the stored tokens).
 
 CI runs pull request code on a self-hosted runner; the repository requires maintainer approval before any workflow
 run from an external contributor.

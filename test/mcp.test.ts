@@ -1,9 +1,11 @@
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { McpAuthenticator } from "../src/auth";
-import { handleRequest } from "../src/index";
 import { DANGEROUS_ACTIONS, type DangerousAction, gateTools } from "../src/mcp/dangerous";
+import type { OwnerState } from "../src/owner/state";
+import { handleRequest } from "../src/routes";
 import { FakeTesla, uniqueName } from "./helpers/fake-tesla";
 
 const ENDPOINT = "https://tesla-mcp.example/mcp";
@@ -13,7 +15,7 @@ afterEach(() => {
 });
 
 /** Each test acts as its own owner (its own OwnerState), through the real
- * /mcp handler, with the authenticator seam PR 2 will use for OAuth. */
+ * /mcp handler, with the authenticator seam a later OAuth sign-in will use. */
 async function connect(overrides: Partial<typeof env> = {}) {
   const ownerId = uniqueName("mcp-owner");
   const authenticator: McpAuthenticator = {
@@ -32,8 +34,8 @@ type ToolResult = { isError?: boolean; structuredContent?: Record<string, unknow
 
 const EXPECTED_TOOLS = [
   "tesla_audit_recent",
+  "tesla_auth_status",
   "tesla_lock",
-  "tesla_nightly_lock_status",
   "tesla_vehicle_status",
   "tesla_vehicles_list",
   "tesla_wake",
@@ -132,11 +134,70 @@ describe("MCP over the real /mcp handler", () => {
     await client.close();
   });
 
-  it("reports the nightly lock schedule", async () => {
+  it("wakes an asleep car, waits for it, locks, and reads the lock state back", async () => {
+    const tesla = new FakeTesla();
+    tesla.state = "asleep";
+    tesla.pollsUntilOnline = 2;
+    tesla.install();
+    const { client, owner } = await connect();
+    await runInDurableObject(owner, (instance: OwnerState) => {
+      instance.sleep = async () => {};
+    });
+    await runInDurableObject(env.TESLA_VCP.get(env.TESLA_VCP.idFromName(tesla.vin)), (instance) => {
+      instance.sleep = async () => {};
+    });
+    const result = (await client.callTool({ name: "tesla_lock", arguments: { confirm: true } })) as ToolResult;
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      summary: "The car woke up and is now locked.",
+      locked: true,
+      confirmed: true,
+      detail: "locked_after_wake",
+      woke: true,
+      attempts: 1,
+    });
+    expect(tesla.car.locked).toBe(true);
+    expect(tesla.fleetRequests.filter((request) => request.path.endsWith("/wake_up"))).toHaveLength(1);
+    expect(tesla.fleetRequests.some((request) => request.path.endsWith("/vehicle_data"))).toBe(true);
+    await client.close();
+  });
+
+  it("names the specific reason when the lock fails", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.handshakeFault = 3;
+    tesla.install();
     const { client } = await connect();
-    const result = (await client.callTool({ name: "tesla_nightly_lock_status", arguments: {} })) as ToolResult;
-    expect(result.structuredContent).toMatchObject({ enabled: true, time: "22:00", timeZone: "America/New_York" });
-    expect(String(result.structuredContent?.summary)).toMatch(/22:00 America\/New_York/);
+    const result = (await client.callTool({ name: "tesla_lock", arguments: { confirm: true } })) as ToolResult;
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: "command_failed", reason: "pairing_required" });
+    expect(String(result.structuredContent?.summary)).toMatch(/Pair the virtual key/);
+    await client.close();
+  });
+
+  it("reports the sign-in state without contacting Tesla", async () => {
+    const tesla = new FakeTesla();
+    tesla.install();
+    const { client } = await connect();
+    // Nothing has signed in yet, but a bootstrap token is ready to use.
+    const ready = (await client.callTool({ name: "tesla_auth_status", arguments: {} })) as ToolResult;
+    expect(ready.structuredContent).toMatchObject({ authState: "ok", message: null });
+    expect(tesla.requests).toHaveLength(0);
+    await client.close();
+  });
+
+  it("reports reauth_required once Tesla rejects the sign-in", async () => {
+    const tesla = new FakeTesla();
+    tesla.tokenResponder = () => Response.json({ error: "invalid_grant" }, { status: 400 });
+    tesla.install();
+    const { client } = await connect();
+    const listed = (await client.callTool({ name: "tesla_vehicles_list", arguments: {} })) as ToolResult;
+    expect(listed.structuredContent).toMatchObject({ error: "reauth_required" });
+    const requests = tesla.requests.length;
+    const status = (await client.callTool({ name: "tesla_auth_status", arguments: {} })) as ToolResult;
+    expect(status.isError).toBeUndefined();
+    expect(status.structuredContent).toMatchObject({ authState: "reauth_required" });
+    expect(String(status.structuredContent?.summary)).toMatch(/wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN/);
+    expect(tesla.requests).toHaveLength(requests);
     await client.close();
   });
 });
