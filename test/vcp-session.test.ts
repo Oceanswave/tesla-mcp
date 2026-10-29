@@ -179,9 +179,14 @@ describe("VCSEC session against a simulated vehicle", () => {
     expect(await codeOf(core.command({ vin: "not-a-vin", accessToken: TOKEN, command: "door_lock" }))).toBe(
       "invalid_request",
     );
-    expect(
-      await codeOf(core.command({ vin: tesla.vin, accessToken: TOKEN, command: "door_unlock" as "door_lock" })),
-    ).toBe("invalid_request");
+    expect(await codeOf(core.command({ vin: tesla.vin, accessToken: TOKEN, command: "get" as "door_lock" }))).toBe(
+      "invalid_request",
+    );
+    // Parameters are checked by the payload builder before any handshake.
+    const badLimit = await core
+      .command({ vin: tesla.vin, accessToken: TOKEN, command: "set_charge_limit", params: { percent: 10 } })
+      .catch((error: unknown) => error);
+    expect(badLimit).toMatchObject({ code: "invalid_request", stage: "param_percent" });
     expect(tesla.requests).toHaveLength(0);
   });
 
