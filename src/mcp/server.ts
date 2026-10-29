@@ -198,7 +198,7 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_nightly_lock_status",
       description:
-        "Report the automatic nightly lock: whether it is on, the local time and time zone it runs, when it runs next, and how the last run went.",
+        "Deprecated: will be removed with the built-in nightly lock. Report the built-in nightly lock: whether it is on, the local time and time zone it runs, when it runs next, how the last run went, and whether Tesla sign-in needs renewing.",
       inputSchema: z.object({}).strict(),
       annotations: { ...READ, openWorldHint: false },
       handler: async () => {

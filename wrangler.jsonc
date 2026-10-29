@@ -12,8 +12,8 @@
   "observability": { "enabled": true },
   "durable_objects": {
     "bindings": [
-      // One OwnerState per owner: encrypted Tesla tokens, audit log, nightly
-      // lock alarm, and the serialized vehicle-command lane.
+      // One OwnerState per owner: encrypted Tesla tokens, audit log, the
+      // serialized vehicle-command lane, and the deprecated nightly alarm.
       { "name": "OWNER", "class_name": "OwnerState" },
       // One TeslaVcpSession per VIN: Vehicle Command Protocol sessions keyed
       // by (VIN, domain). Session keys live in memory only.
@@ -22,8 +22,8 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OwnerState", "TeslaVcpSession"] }],
   "triggers": {
-    // The cron only re-arms the OwnerState alarm (idempotent). The nightly
-    // lock itself runs from the Durable Object alarm at the exact local time.
+    // Deprecated with the built-in nightly lock: the cron only re-arms the
+    // OwnerState alarm (idempotent). Removed together with the alarm.
     "crons": ["*/15 * * * *"]
   },
   // Non-secret configuration. Secrets are listed in .dev.vars.example and set
@@ -34,6 +34,9 @@
     // Public by definition: Tesla fetches it from
     // /.well-known/appspecific/com.tesla.3p.public-key.pem.
     "TESLA_PUBLIC_KEY_PEM": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEzU4sPRPe2N2yXYwhSgMjPAVW6Voq\nfHxe3wguACnHbh7buD93WNbnVSvCcPyCBtYRoj3m4MEoOlKtMah7cKH2OQ==\n-----END PUBLIC KEY-----\n",
+    // Deprecated built-in nightly lock. Still on so the car keeps locking
+    // while the outside caller (scripts/nightly-lock/) proves itself; set to
+    // "false" to hand over, then the alarm and these three vars are removed.
     "NIGHTLY_LOCK_ENABLED": "true",
     "NIGHTLY_LOCK_TIME": "22:00",
     "NIGHTLY_LOCK_TIMEZONE": "America/New_York",

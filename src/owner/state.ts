@@ -1,6 +1,7 @@
 // OwnerState: one Durable Object per owner. Holds the encrypted Tesla tokens,
-// the audit log, the nightly-lock alarm, and the serialized vehicle-command
-// lane. Everything that talks to Tesla on the owner's behalf goes through here.
+// the audit log, the serialized vehicle-command lane, and (deprecated) the
+// built-in nightly-lock alarm. Everything that talks to Tesla on the owner's
+// behalf goes through here.
 
 import { DurableObject } from "cloudflare:workers";
 import { bytesToHex, sha256 } from "../bytes";
@@ -611,7 +612,13 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
-  // Nightly lock
+  // Built-in nightly lock (deprecated)
+  //
+  // A schedule is the caller's business, not the server's: an outside caller
+  // runs tesla_lock on its own timer (see scripts/nightly-lock/). This alarm
+  // stays on, behind NIGHTLY_LOCK_ENABLED, only until that caller has run
+  // successfully; then everything in this section, the cron trigger, and
+  // tesla_nightly_lock_status are removed.
   // ---------------------------------------------------------------------------
 
   private nightlyConfig(): NightlyConfig {
@@ -758,6 +765,9 @@ export class OwnerState extends DurableObject<Env> {
       );
     } else {
       this.finishNightly(run, "error", result.error.code);
+      console.error(
+        `[tesla-mcp] nightly lock failed for ${runDate}: ${result.error.code}${result.error.reason ? ` (${result.error.reason})` : ""}`,
+      );
     }
     await this.ensureAlarm();
   }

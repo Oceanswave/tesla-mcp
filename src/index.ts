@@ -121,7 +121,8 @@ export default {
     return handleRequest(request, env);
   },
   async scheduled(_controller, env, ctx) {
-    // The cron's only job: keep the nightly-lock alarm armed (idempotent).
+    // Deprecated with the built-in nightly lock: the cron's only job is to keep
+    // its alarm armed (idempotent). Removed together with the alarm.
     const owner = env.OWNER.get(env.OWNER.idFromName(OWNER_ID));
     ctx.waitUntil(owner.ensureAlarm());
   },

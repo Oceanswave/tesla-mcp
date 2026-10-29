@@ -75,7 +75,12 @@ describe("nightly lock alarm", () => {
     tesla.state = "asleep";
     tesla.pollsUntilOnline = Number.POSITIVE_INFINITY;
     const stub = await setup(tesla);
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
     expect(await runDurableObjectAlarm(stub)).toBe(true);
+    // Loud: the failure reaches the Worker logs, with codes only.
+    expect(logged).toHaveBeenCalledWith(
+      "[tesla-mcp] nightly lock failed for 2030-06-15: command_failed (vehicle_unavailable)",
+    );
 
     expect(tesla.car.locked).toBe(false);
     // Four lock attempts; each handshake retries a 408 three times, as the
