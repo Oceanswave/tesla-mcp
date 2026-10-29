@@ -35,11 +35,15 @@ function accessToken(sub: string, scp: string[]): string {
   return `${base64url({ alg: "RS256", typ: "JWT" })}.${base64url({ sub, scp, nonce: crypto.randomUUID() })}.sig`;
 }
 
-/** A fake Tesla whose token endpoint issues JWT access tokens for `sub`. */
-function tesla(sub = "owner-account", scope: string | null = SCOPES.join(" ")): FakeTesla {
+/** A fake Tesla whose token endpoint issues JWT access tokens for `sub`
+ * (per grant type when it is a function). */
+function tesla(
+  sub: string | ((grantType: string | null) => string) = "owner-account",
+  scope: string | null = SCOPES.join(" "),
+): FakeTesla {
   const fake = new FakeTesla();
-  fake.tokenResponder = () => {
-    const access = accessToken(sub, SCOPES);
+  fake.tokenResponder = (form) => {
+    const access = accessToken(typeof sub === "string" ? sub : sub(form.get("grant_type")), SCOPES);
     const refresh = `refresh-${crypto.randomUUID()}`;
     fake.issuedAccessTokens.push(access);
     fake.issuedRefreshTokens.push(refresh);
@@ -178,7 +182,8 @@ describe("GET /callback", () => {
     const page = await replay.text();
     expect(page).toMatch(/missing, expired, or already used/);
     expect(page).not.toContain("second");
-    expect(fake.tokenRequests.map((form) => form.get("code"))).toEqual(["first"]);
+    const codes = fake.tokenRequests.filter((form) => form.get("grant_type") === "authorization_code");
+    expect(codes.map((form) => form.get("code"))).toEqual(["first"]);
   });
 
   it("rejects missing, unknown, malformed, and expired states without calling Tesla", async () => {
@@ -274,6 +279,51 @@ describe("GET /callback", () => {
     expect(healthy.tokenRequests.at(-1)?.get("refresh_token")).toBe(healthy.issuedRefreshTokens[0]);
   });
 
+  it("keeps the account pinned after a re-seed leaves no access token", async () => {
+    const fake = tesla("owner-account");
+    const ownerId = uniqueName("callback");
+    expect(await owner(ownerId).listVehicles()).toMatchObject({ ok: true });
+    // A new bootstrap value that Tesla rejects: stored tokens now hold no access token.
+    fake.tokenResponder = () => Response.json({ error: "invalid_grant" }, { status: 400 });
+    await runInDurableObject(owner(ownerId), async (instance: OwnerState) => {
+      Object.assign(instance, { env: { ...env, TESLA_BOOTSTRAP_REFRESH_TOKEN: "rejected-bootstrap-token" } });
+      await expect(instance.getAccessToken()).rejects.toThrow(/sign-in has expired/);
+    });
+    expect((await storedTokens(ownerId))?.accessToken).toBeNull();
+    vi.restoreAllMocks();
+    tesla("someone-else");
+    const flow = browser(ownerId);
+    expect((await flow.get(`/callback?code=abc&state=${await flow.login()}`)).status).toBe(403);
+    vi.restoreAllMocks();
+    tesla("owner-account");
+    expect((await flow.get(`/callback?code=abc&state=${await flow.login()}`)).status).toBe(200);
+    expect((await owner(ownerId).authStatus()).authState).toBe("ok");
+  });
+
+  it("tries a bootstrap token not used yet before the code, and pins to its account", async () => {
+    const fake = tesla((grantType) => (grantType === "refresh_token" ? "owner-account" : "someone-else"));
+    const ownerId = uniqueName("callback");
+    const flow = browser(ownerId);
+    expect((await flow.get(`/callback?code=abc&state=${await flow.login()}`)).status).toBe(403);
+    expect(fake.tokenRequests.map((form) => form.get("grant_type"))).toEqual(["refresh_token", "authorization_code"]);
+    expect(fake.tokenRequests[0]?.get("refresh_token")).toBe(env.TESLA_BOOTSTRAP_REFRESH_TOKEN);
+    // The bootstrap sign-in stays in place.
+    expect((await storedTokens(ownerId))?.refreshToken).toBe(fake.issuedRefreshTokens[0]);
+  });
+
+  it("lets the first sign-in name the account on a server that never had one", async () => {
+    tesla("first-account");
+    const ownerId = uniqueName("callback");
+    const flow = browser(ownerId);
+    await runInDurableObject(owner(ownerId), (instance: OwnerState) => {
+      Object.assign(instance, { env: { ...env, TESLA_BOOTSTRAP_REFRESH_TOKEN: "" } });
+    });
+    expect((await flow.get(`/callback?code=abc&state=${await flow.login()}`)).status).toBe(200);
+    vi.restoreAllMocks();
+    tesla("second-account");
+    expect((await flow.get(`/callback?code=abc&state=${await flow.login()}`)).status).toBe(403);
+  });
+
   it("sends client_secret when configured", async () => {
     const fake = tesla();
     const secret = `secret-${crypto.randomUUID()}`;
@@ -282,7 +332,8 @@ describe("GET /callback", () => {
       const state = await instance.beginSignIn(`${BASE}/callback`);
       expect(await instance.completeSignIn({ state, code: "abc", error: null })).toMatchObject({ ok: true });
     });
-    expect(fake.tokenRequests[0]?.get("client_secret")).toBe(secret);
+    expect(fake.tokenRequests.at(-1)?.get("grant_type")).toBe("authorization_code");
+    expect(fake.tokenRequests.at(-1)?.get("client_secret")).toBe(secret);
   });
 
   it("keeps the MCP tools working on the new sign-in", async () => {
@@ -301,10 +352,10 @@ describe("GET /callback", () => {
     await client.connect(transport);
     const listed = (await client.callTool({ name: "tesla_vehicles_list", arguments: {} })) as ToolResult;
     expect(listed.structuredContent?.vehicles).toEqual([{ id: fake.vehicleId, name: "Test Car", state: "online" }]);
-    expect(fake.fleetRequests.at(-1)?.authorization).toBe(`Bearer ${fake.issuedAccessTokens[0]}`);
+    expect(fake.fleetRequests.at(-1)?.authorization).toBe(`Bearer ${fake.issuedAccessTokens.at(-1)}`);
     const status = (await client.callTool({ name: "tesla_auth_status", arguments: {} })) as ToolResult;
     expect(status.structuredContent).toMatchObject({ authState: "ok", scopes: SCOPES });
-    expect(JSON.stringify(status)).not.toContain(fake.issuedAccessTokens[0]);
+    for (const token of fake.issuedAccessTokens) expect(JSON.stringify(status)).not.toContain(token);
     await client.close();
   });
 });

@@ -375,8 +375,9 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   /** Tesla rotates refresh tokens and invalidates the old one: persist the
-   * new pair before anyone can use the access token. Runs only inside the
-   * token flight. */
+   * new pair before anyone can use the access token. Also records the
+   * account (`sub`) the tokens belong to, which browser sign-in is pinned to
+   * and which outlives a re-seed. Runs only inside the token flight. */
   private async storeTokens(issued: IssuedTokens, previousRefreshToken: string | null): Promise<void> {
     const refreshToken = issued.refreshToken ?? previousRefreshToken;
     if (!refreshToken) throw new OwnerError("token_refresh_failed", "Tesla did not issue a refresh token.");
@@ -386,6 +387,8 @@ export class OwnerState extends DurableObject<Env> {
       expiresAt: this.clock() + Math.min(issued.expiresIn, 30 * 86_400) * 1000,
     });
     this.kvSet("tokens", encrypted);
+    const account = accessTokenClaims(issued.accessToken).sub;
+    if (account) this.kvSet("account_sub", account);
     this.refreshCount++;
   }
 
@@ -947,8 +950,9 @@ export class OwnerState extends DurableObject<Env> {
   /** Finish a browser sign-in. The state is consumed first, whatever happens
    * next. The code is exchanged with the redirect URI stored with the state,
    * and the new tokens replace the stored ones through the token flight, as a
-   * refresh does. Once an account is signed in, only the same Tesla account
-   * (the access token's `sub`) can sign in again: /login is public. */
+   * refresh does. /login is public, so once any token has named the account
+   * (its `sub`), only that Tesla account can sign in. A bootstrap value not
+   * tried yet is tried first: it is the owner's, and may name the account. */
   async completeSignIn(input: { state: string; code: string | null; error: string | null }): Promise<SignInResult> {
     const pending = SIGN_IN_STATE_PATTERN.test(input.state)
       ? this.ctx.storage.sql
@@ -963,6 +967,11 @@ export class OwnerState extends DurableObject<Env> {
     if (input.error || !input.code) return { ok: false, reason: "denied" };
     try {
       await this.tokenKey();
+      const bootstrap = this.env.TESLA_BOOTSTRAP_REFRESH_TOKEN?.trim();
+      if (bootstrap && this.kvGet("seed_fingerprint") !== (await fingerprint(bootstrap))) {
+        // Seeds and refreshes; a rejected value ends in reauth_required, as on any request.
+        await this.getAccessToken().catch(() => undefined);
+      }
       const { status, body } = await this.tokenRequest("browser_sign_in", {
         grant_type: "authorization_code",
         code: input.code,
@@ -975,7 +984,7 @@ export class OwnerState extends DurableObject<Env> {
         return { ok: false, reason: "exchange_failed" };
       }
       const claims = accessTokenClaims(issued.accessToken);
-      const current = (await this.storedClaims()).sub;
+      const current = this.kvGet("account_sub") ?? (await this.storedClaims()).sub;
       if (current && current !== claims.sub) {
         this.audit({
           source: "system",
@@ -1001,14 +1010,11 @@ export class OwnerState extends DurableObject<Env> {
     }
   }
 
-  /** Runs as the token flight. The bootstrap value set now counts as seeded:
-   * this sign-in supersedes it, and only a new value replaces it again. */
+  /** Runs as the token flight. The bootstrap value in place was tried before
+   * the exchange, so it never overrides this sign-in; a new value does. */
   private async adoptSignIn(issued: IssuedTokens): Promise<string> {
     const replaced = this.kvGet("tokens") !== null;
-    const bootstrap = this.env.TESLA_BOOTSTRAP_REFRESH_TOKEN?.trim();
-    const seed = bootstrap ? await fingerprint(bootstrap) : null;
     await this.storeTokens(issued, null);
-    if (seed) this.kvSet("seed_fingerprint", seed);
     this.kvDelete("auth_state");
     this.vehicleCache = null;
     this.siteCache = null;

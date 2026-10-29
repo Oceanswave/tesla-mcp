@@ -324,9 +324,11 @@ from it). Node 22 or newer.
    rotates refresh tokens and the Worker keeps the newest, so do not share this sign-in with another Tesla tool:
    whichever one refreshes second is locked out.
 
-   `/login` is public, so once an account is signed in, `/callback` only accepts the same Tesla account (by the
-   access token's `sub`); a sign-in with any other account is refused and changes nothing. To move the server to
-   another account, set a refresh token for it with `TESLA_BOOTSTRAP_REFRESH_TOKEN` (below).
+   `/login` is public, so the server remembers which Tesla account its tokens belong to (the access token's
+   `sub`), and `/callback` refuses any other account and changes nothing. A `TESLA_BOOTSTRAP_REFRESH_TOKEN` not
+   used yet is tried before the code, so it names the account first. On a server that has never held a token,
+   the first sign-in names the account: sign in right after the first deploy (or set the bootstrap token). To move
+   the server to another account, set a refresh token for it with `TESLA_BOOTSTRAP_REFRESH_TOKEN` (below).
 
    Instead of the browser, you can complete Tesla's authorization-code flow elsewhere and store the refresh token
    with `npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. It seeds the encrypted token store once per
