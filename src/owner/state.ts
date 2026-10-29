@@ -5,9 +5,22 @@
 import { DurableObject } from "cloudflare:workers";
 import { bytesToHex, sha256 } from "../bytes";
 import type { Env } from "../env";
+import { type DangerousAction, dangerousCommandsEnabled, dangerousSignedCommand } from "../mcp/dangerous";
+import {
+  describeScopes,
+  EndpointParamError,
+  endpointScopes,
+  FLEET_ENDPOINTS,
+  type FleetEndpointName,
+  isFleetEndpointName,
+  type ScopeRequirement,
+  signedCommandScopes,
+} from "../tesla/endpoints";
 import { FleetClient, FleetError, summarizeVehicleData, type VehicleSummary } from "../tesla/fleet";
 import { defaultFetch, type FetchFn, fetchUpstream, readBoundedText } from "../tesla/http";
-import type { SignedCommandResult } from "../tesla/vcp/session";
+import type { CommandParams } from "../tesla/vcp/payloads";
+import { isSignedCommandName, type SignedCommandName } from "../tesla/vcp/protocol";
+import type { SignedCommandResult, VcpErrorCode } from "../tesla/vcp/session";
 import { LOCK_POLICY, type LockFailureCode, type LockOutcome, lockWithRetry } from "./lock";
 import { decryptTokens, encryptTokens, importTokenKey, type StoredTokens } from "./tokens";
 
@@ -16,6 +29,7 @@ const TOKEN_TIMEOUT_MS = 15_000;
 const MAX_TOKEN_BODY_BYTES = 32_768;
 const AUDIT_KEEP_ROWS = 1000;
 const VEHICLE_CACHE_MS = 5 * 60_000;
+const ID_PATTERN = /^\d{1,20}$/;
 
 /** The one-step fix for a rejected Tesla sign-in, shown to callers. */
 const REAUTH_MESSAGE =
@@ -47,11 +61,36 @@ export type OwnerErrorCode =
   | "vehicle_asleep"
   | "tesla_unavailable"
   | "rate_limited"
+  | "forbidden"
+  | "invalid_request"
+  | "not_supported"
+  | "dangerous_disabled"
+  | "no_energy_sites"
+  | "energy_site_id_required"
+  | "energy_site_not_found"
   | "command_failed";
 
-/** `reason` names the specific lock failure (pairing_required, wake_timeout,
- * still_unlocked, ...) so a caller can act on it without parsing prose. */
-export type OwnerFailure = { code: OwnerErrorCode; message: string; reason?: LockFailureCode };
+/** `reason` names the specific failure (pairing_required, wake_timeout,
+ * still_unlocked, command_rejected, ...) so a caller can act on it without
+ * parsing prose. `carReason` is the car's own short reason, when it gave one
+ * (for example is_charging or already_set). */
+export type OwnerFailure = {
+  code: OwnerErrorCode;
+  message: string;
+  reason?: LockFailureCode | VcpErrorCode;
+  carReason?: string;
+};
+
+export type EnergySiteSummary = { energySiteId: string; name: string | null; resourceType: string | null };
+
+export type EndpointInput = {
+  vehicleId?: string;
+  energySiteId?: string;
+  params?: Readonly<Record<string, unknown>>;
+};
+
+/** `data` is Tesla's parsed JSON `response`, passed through as is. */
+export type EndpointSuccess = { data: unknown; vehicleId?: string; energySiteId?: string };
 
 export type OwnerResult<T> = { ok: true; data: T } | { ok: false; error: OwnerFailure };
 
@@ -95,6 +134,7 @@ export class OwnerState extends DurableObject<Env> {
   private refreshCount = 0;
   private lane: Promise<unknown> = Promise.resolve();
   private vehicleCache: { at: number; vehicles: VehicleSummary[] } | null = null;
+  private siteCache: { at: number; sites: EnergySiteSummary[] } | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -368,9 +408,10 @@ export class OwnerState extends DurableObject<Env> {
     }
   }
 
-  private async signedLock(vin: string): Promise<SignedCommandResult> {
+  private async signed(vin: string, command: SignedCommandName, params?: CommandParams): Promise<SignedCommandResult> {
     const stub = this.env.TESLA_VCP.get(this.env.TESLA_VCP.idFromName(vin));
-    const send = async (accessToken: string) => stub.signedCommand({ vin, accessToken, command: "door_lock" });
+    const send = async (accessToken: string) =>
+      stub.signedCommand({ vin, accessToken, command, ...(params ? { params } : {}) });
     const first = await send(await this.getAccessToken());
     if (first.ok || first.error.code !== "unauthorized") return first;
     return send(await this.getAccessToken(true));
@@ -414,9 +455,28 @@ export class OwnerState extends DurableObject<Env> {
     return run;
   }
 
-  private failure(error: unknown): { ok: false; error: OwnerFailure } {
+  private failure(error: unknown, scopes?: ScopeRequirement): { ok: false; error: OwnerFailure } {
     if (error instanceof OwnerError) return { ok: false, error: { code: error.code, message: error.message } };
+    if (error instanceof EndpointParamError) {
+      return { ok: false, error: { code: "invalid_request", message: `The ${error.param} value is not valid.` } };
+    }
     if (error instanceof FleetError) {
+      if (error.code === "forbidden") return { ok: false, error: forbidden(scopes) };
+      if (error.code === "invalid_request") {
+        return {
+          ok: false,
+          error: {
+            code: "invalid_request",
+            message: "Tesla rejected the request as invalid for this account or product.",
+          },
+        };
+      }
+      if (error.code === "not_supported") {
+        return {
+          ok: false,
+          error: { code: "not_supported", message: "Tesla says this is not available for this vehicle or product." },
+        };
+      }
       if (error.code === "rate_limited") {
         return {
           ok: false,
@@ -440,6 +500,7 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   private errorDetail(error: unknown): string {
+    if (error instanceof EndpointParamError) return error.message;
     if (error instanceof OwnerError || error instanceof FleetError)
       return error instanceof OwnerError ? error.code : error.message;
     return "internal_error";
@@ -539,7 +600,7 @@ export class OwnerState extends DurableObject<Env> {
                 throw error;
             }
           },
-          sendLock: () => this.signedLock(vehicle.vin),
+          sendLock: () => this.signed(vehicle.vin, "door_lock"),
           isLocked: async () => {
             try {
               return summarizeVehicleData(await this.withToken((token) => fleet.vehicleData(token, vehicle.id))).locked;
@@ -581,6 +642,178 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   // ---------------------------------------------------------------------------
+  // Energy sites
+  // ---------------------------------------------------------------------------
+
+  private async energySites(fresh = false): Promise<EnergySiteSummary[]> {
+    if (!fresh && this.siteCache && this.clock() - this.siteCache.at < VEHICLE_CACHE_MS) return this.siteCache.sites;
+    const products = await this.withToken((token) =>
+      this.fleet().call(token, FLEET_ENDPOINTS.products.build({ params: {} })),
+    );
+    if (!Array.isArray(products)) throw new FleetError("bad_response", null);
+    const sites = products.flatMap((product): EnergySiteSummary[] => {
+      const record = product && typeof product === "object" ? (product as Record<string, unknown>) : null;
+      const id = record?.energy_site_id;
+      if (typeof id !== "string" || !ID_PATTERN.test(id)) return [];
+      const text = (value: unknown) => (typeof value === "string" && value.length <= 128 ? value : null);
+      return [{ energySiteId: id, name: text(record?.site_name), resourceType: text(record?.resource_type) }];
+    });
+    this.siteCache = { at: this.clock(), sites };
+    return sites;
+  }
+
+  /** Like resolveVehicle: an explicit id must be on the account; with none,
+   * the account's only energy site is used. */
+  private async resolveEnergySite(energySiteId: string | undefined): Promise<EnergySiteSummary> {
+    const sites = await this.energySites();
+    if (energySiteId) {
+      const match = sites.find((site) => site.energySiteId === energySiteId);
+      if (!match) throw new OwnerError("energy_site_not_found", "That energy site is not on this Tesla account.");
+      return match;
+    }
+    if (sites.length === 1) return sites[0] as EnergySiteSummary;
+    if (!sites.length) throw new OwnerError("no_energy_sites", "This Tesla account has no energy products.");
+    throw new OwnerError(
+      "energy_site_id_required",
+      `This account has ${sites.length} energy sites. Say which one: ${sites
+        .map((site) => `${site.name ?? "unnamed"} (id ${site.energySiteId})`)
+        .join(", ")}.`,
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // Allowlisted Fleet endpoints and signed commands
+  // ---------------------------------------------------------------------------
+
+  private refuseDangerous(action: DangerousAction | undefined): void {
+    if (action && !dangerousCommandsEnabled(this.env)) {
+      throw new OwnerError(
+        "dangerous_disabled",
+        `This server does not send ${action.replaceAll("_", " ")} commands (DANGEROUS_COMMANDS_ENABLED is not "true").`,
+      );
+    }
+  }
+
+  /** Call one endpoint from FLEET_ENDPOINTS. Reads never wake the car (Fleet
+   * answers 408 while it sleeps). Changes run in the command lane and are
+   * audited. */
+  async fleetEndpoint(name: FleetEndpointName, input: EndpointInput = {}): Promise<OwnerResult<EndpointSuccess>> {
+    if (!isFleetEndpointName(name)) {
+      return { ok: false, error: { code: "invalid_request", message: "Unknown endpoint." } };
+    }
+    const endpoint: (typeof FLEET_ENDPOINTS)[FleetEndpointName] = FLEET_ENDPOINTS[name];
+    const params = input.params ?? {};
+    const scopes = endpointScopes(name, params);
+    const run = async (): Promise<OwnerResult<EndpointSuccess>> => {
+      let vehicleId: string | null = input.vehicleId ?? null;
+      let energySiteId: string | null = input.energySiteId ?? null;
+      try {
+        this.refuseDangerous("dangerousAction" in endpoint ? endpoint.dangerousAction : undefined);
+        let vin: string | undefined;
+        if (endpoint.target === "vehicle") {
+          const vehicle = await this.resolveVehicle(input.vehicleId);
+          vehicleId = vehicle.id;
+          vin = vehicle.vin;
+        } else if (endpoint.target === "energy_site") {
+          energySiteId = (await this.resolveEnergySite(input.energySiteId)).energySiteId;
+        }
+        const request = endpoint.build({
+          vehicleId: vehicleId ?? undefined,
+          vin,
+          energySiteId: energySiteId ?? undefined,
+          params,
+        });
+        const data = await this.withToken((token) => this.fleet().call(token, request));
+        if ("vehicleCommand" in endpoint) {
+          const response = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
+          if (response.result !== true) {
+            const carReason = sanitizeCarReason(response.reason);
+            this.audit({ source: "tool", action: name, vehicleId, outcome: "error", detail: `rejected ${carReason}` });
+            return {
+              ok: false,
+              error: {
+                code: "command_failed",
+                reason: "command_rejected",
+                carReason,
+                message: `The car refused the command (${carReason}).`,
+              },
+            };
+          }
+        }
+        if (endpoint.mutates) {
+          this.audit({
+            source: "tool",
+            action: name,
+            vehicleId,
+            outcome: "ok",
+            detail: energySiteId ? `site ${energySiteId}` : "ok",
+          });
+        }
+        return {
+          ok: true,
+          data: {
+            data,
+            ...(vehicleId ? { vehicleId } : {}),
+            ...(energySiteId ? { energySiteId } : {}),
+          },
+        };
+      } catch (error) {
+        if (endpoint.mutates) {
+          this.audit({ source: "tool", action: name, vehicleId, outcome: "error", detail: this.errorDetail(error) });
+        }
+        if (endpoint.target !== "vehicle" && error instanceof FleetError && error.code === "vehicle_unavailable") {
+          return {
+            ok: false,
+            error: { code: "tesla_unavailable", message: "The energy site did not respond. It may be offline." },
+          };
+        }
+        return this.failure(error, scopes);
+      }
+    };
+    return endpoint.mutates ? this.inLane(run) : run();
+  }
+
+  /** Send one signed command from SIGNED_COMMANDS. Never wakes the car: an
+   * asleep car fails with vehicle_asleep, and the caller decides whether to
+   * wake it. Lock has its own wake-and-retry flow (lock()). */
+  async signedVehicleCommand(input: {
+    command: SignedCommandName;
+    params?: CommandParams;
+    vehicleId?: string;
+  }): Promise<OwnerResult<{ vehicleId: string }>> {
+    const { command } = input;
+    if (!isSignedCommandName(command)) {
+      return { ok: false, error: { code: "invalid_request", message: "Unknown command." } };
+    }
+    const params = input.params ?? {};
+    return this.inLane(async () => {
+      let vehicleId: string | null = input.vehicleId ?? null;
+      try {
+        this.refuseDangerous(dangerousSignedCommand(command, params));
+        const vehicle = await this.resolveVehicle(input.vehicleId);
+        vehicleId = vehicle.id;
+        const sent = await this.signed(vehicle.vin, command, params);
+        if (sent.ok) {
+          this.audit({ source: "tool", action: command, vehicleId, outcome: "ok", detail: "signed" });
+          return { ok: true as const, data: { vehicleId: vehicle.id } };
+        }
+        const { code, stage, reason } = sent.error;
+        this.audit({
+          source: "tool",
+          action: command,
+          vehicleId,
+          outcome: "error",
+          detail: `${code} ${stage}${reason ? ` ${reason}` : ""}`,
+        });
+        return { ok: false as const, error: signedFailure(code, reason, signedCommandScopes(command)) };
+      } catch (error) {
+        this.audit({ source: "tool", action: command, vehicleId, outcome: "error", detail: this.errorDetail(error) });
+        return this.failure(error, signedCommandScopes(command));
+      }
+    });
+  }
+
+  // ---------------------------------------------------------------------------
   // Sign-in state
   // ---------------------------------------------------------------------------
 
@@ -595,6 +828,78 @@ export class OwnerState extends DurableObject<Env> {
       return { authState: "reauth_required", message: REAUTH_MESSAGE };
     if (!this.kvGet("tokens")) return { authState: "not_configured", message: NOT_CONNECTED_MESSAGE };
     return { authState: "ok", message: null };
+  }
+}
+
+function forbidden(scopes: ScopeRequirement | undefined): OwnerFailure {
+  return {
+    code: "forbidden",
+    message: scopes
+      ? `Tesla refused this request. The app's sign-in needs the ${describeScopes(scopes)} scope; ` +
+        "sign in again with it, or check that this account may use this vehicle or product."
+      : "Tesla refused this request for this account.",
+  };
+}
+
+/** The car's own reason ("is_charging", "already_set"), when short and
+ * printable. */
+function sanitizeCarReason(value: unknown): string {
+  return typeof value === "string" && /^[A-Za-z0-9 _.,:'()/-]{1,80}$/.test(value) ? value : "unspecified";
+}
+
+function signedFailure(code: VcpErrorCode, carReason: string | undefined, scopes: ScopeRequirement): OwnerFailure {
+  switch (code) {
+    case "unauthorized":
+      return { code: "reauth_required", reason: code, message: REAUTH_MESSAGE };
+    case "forbidden":
+      return { ...forbidden(scopes), reason: code };
+    case "rate_limited":
+      return {
+        code: "rate_limited",
+        reason: code,
+        message: "Tesla is rate limiting commands. Try again in a few minutes.",
+      };
+    case "vehicle_unavailable":
+      return {
+        code: "vehicle_asleep",
+        reason: code,
+        message: "The car is asleep or offline. Wake it with tesla_wake, then try again.",
+      };
+    case "unconfigured":
+      return { code: "not_configured", reason: code, message: "Signed commands are not configured on this server." };
+    case "invalid_request":
+      return { code: "invalid_request", reason: code, message: "The command's parameters are not valid." };
+    case "pairing_required":
+      return {
+        code: "command_failed",
+        reason: code,
+        message: "The car does not recognize this app's key. Pair the virtual key in the Tesla app, then try again.",
+      };
+    case "remote_access_required":
+      return {
+        code: "command_failed",
+        reason: code,
+        message: "Mobile access is turned off in the car. Turn it on, then try again.",
+      };
+    case "command_rejected":
+      return {
+        code: "command_failed",
+        reason: code,
+        ...(carReason ? { carReason } : {}),
+        message: carReason ? `The car refused the command (${carReason}).` : "The car refused the command.",
+      };
+    case "status_unknown":
+      return {
+        code: "command_failed",
+        reason: code,
+        message: "Tesla did not confirm the command ran. Check the car's status before trying again.",
+      };
+    default:
+      return {
+        code: "tesla_unavailable",
+        reason: code,
+        message: "Tesla's service did not respond as expected. Try again shortly.",
+      };
   }
 }
 

@@ -1,6 +1,7 @@
 // Tesla Fleet API (REST) calls. Signed vehicle commands go through
 // TeslaVcpSession; this module covers the plain JSON endpoints.
 
+import type { FleetRequest } from "./endpoints";
 import { defaultFetch, type FetchFn, fetchUpstream, readBoundedText } from "./http";
 import { validFleetBaseUrl } from "./vcp/session";
 
@@ -13,6 +14,8 @@ export type FleetErrorCode =
   | "vehicle_unavailable"
   | "not_found"
   | "rate_limited"
+  | "invalid_request"
+  | "not_supported"
   | "upstream_error"
   | "bad_response";
 
@@ -103,7 +106,18 @@ export class FleetClient {
     return vehicleId;
   }
 
-  private async request(accessToken: string, method: "GET" | "POST", path: string): Promise<unknown> {
+  /** One allowlisted endpoint call (see endpoints.ts). Returns `response`. */
+  async call(accessToken: string, request: FleetRequest): Promise<unknown> {
+    if (!request.path.startsWith("/api/1/")) throw new FleetError("not_found", null);
+    return this.request(accessToken, request.method, request.path, request.body);
+  }
+
+  private async request(
+    accessToken: string,
+    method: FleetRequest["method"],
+    path: string,
+    body: Record<string, unknown> = {},
+  ): Promise<unknown> {
     let response: Response;
     try {
       response = await fetchUpstream(
@@ -116,7 +130,7 @@ export class FleetClient {
             Accept: "application/json",
             ...(method === "POST" ? { "Content-Type": "application/json" } : {}),
           },
-          ...(method === "POST" ? { body: "{}" } : {}),
+          ...(method === "POST" ? { body: JSON.stringify(body) } : {}),
         },
         FLEET_TIMEOUT_MS,
       );
@@ -131,18 +145,26 @@ export class FleetClient {
       if (status === 404) throw new FleetError("not_found", status);
       if (status === 408) throw new FleetError("vehicle_unavailable", status);
       if (status === 429) throw new FleetError("rate_limited", status);
+      if (status === 400 || status === 422) throw new FleetError("invalid_request", status);
+      if (status === 412 || status === 501) throw new FleetError("not_supported", status);
       throw new FleetError("upstream_error", status);
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await readBoundedText(response, MAX_FLEET_BODY_BYTES));
+      parsed = JSON.parse(quoteEnergySiteIds(await readBoundedText(response, MAX_FLEET_BODY_BYTES)));
     } catch {
       throw new FleetError("bad_response", null);
     }
-    const body = record(parsed);
-    if (!body || !("response" in body)) throw new FleetError("bad_response", null);
-    return body.response;
+    const envelope = record(parsed);
+    if (!envelope || !("response" in envelope)) throw new FleetError("bad_response", null);
+    return envelope.response;
   }
+}
+
+/** Energy site ids are integers that can exceed 2^53, which JSON.parse would
+ * silently round. Read them as strings so they round-trip exactly. */
+export function quoteEnergySiteIds(text: string): string {
+  return text.replace(/("energy_site_id"\s*:\s*)(-?\d+)/g, '$1"$2"');
 }
 
 function num(value: unknown): number | null {

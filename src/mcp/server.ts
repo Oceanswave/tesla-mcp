@@ -1,7 +1,15 @@
 import { type CallToolResult, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { Env } from "../env";
-import type { AuditRow, OwnerFailure, OwnerState } from "../owner/state";
+import type { AuditRow, EndpointSuccess, OwnerFailure, OwnerResult, OwnerState } from "../owner/state";
+import {
+  describeScopes,
+  endpointScopes,
+  FLEET_ENDPOINTS,
+  type ScopeRequirement,
+  signedCommandScopes,
+} from "../tesla/endpoints";
+import { CATALOG, PING_TOOL, summaryText, type ToolSpec } from "./catalog";
 import { type DangerousAction, dangerousCommandsEnabled, gateTools } from "./dangerous";
 
 export const SERVER_VERSION = "0.1.0";
@@ -20,11 +28,16 @@ type ToolDefinition = {
   };
   /** Set for tools behind the dangerous-command gate. */
   dangerousAction?: DangerousAction;
+  /** Tesla OAuth scopes the call needs; absent for tools that never call
+   * Tesla with the owner's token on their own behalf. */
+  scopes?: ScopeRequirement;
   handler: (input: Record<string, unknown>) => Promise<CallToolResult>;
 };
 
 const READ = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true };
 const COMMAND = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true };
+const READ_SCOPES: ScopeRequirement = { anyOf: ["vehicle_device_data"] };
+const COMMAND_SCOPES: ScopeRequirement = { anyOf: ["vehicle_cmds"] };
 
 const vehicleId = z
   .string()
@@ -41,6 +54,11 @@ const dryRun = z
   .boolean()
   .optional()
   .describe("When true, check the request and describe what would happen without contacting the car.");
+const energySiteId = z
+  .string()
+  .regex(/^\d{1,20}$/)
+  .optional()
+  .describe("Tesla energy_site_id from tesla_account_products. Leave out when the account has one energy site.");
 
 function result(value: Record<string, unknown>, isError = false): CallToolResult {
   return {
@@ -56,6 +74,7 @@ function failure(error: OwnerFailure | { code: "internal_error"; message: string
       summary: error.message,
       error: error.code,
       ...("reason" in error && error.reason ? { reason: error.reason } : {}),
+      ...("carReason" in error && error.carReason ? { carReason: error.carReason } : {}),
     },
     true,
   );
@@ -90,13 +109,95 @@ async function commandGate(
   if (input.dryRun === true) {
     await owner.recordAudit({ source: "tool", action, vehicleId: vehicle, outcome: "ok", detail: "dry_run" });
     return result({
-      summary: `Dry run: this would ${describe}. Nothing was sent to the car.`,
+      summary: `Dry run: this would ${describe}. Nothing was sent to Tesla.`,
       dryRun: true,
       action,
       vehicleId: vehicle ?? "default",
+      ...(typeof input.energy_site_id === "string" ? { energySiteId: input.energy_site_id } : {}),
     });
   }
   return run();
+}
+
+/** The inputs a spec adds beyond the shared ones, as command parameters. */
+function specParams(spec: ToolSpec, input: Record<string, unknown>): Record<string, unknown> {
+  if (spec.params) return spec.params(input);
+  const params: Record<string, unknown> = {};
+  for (const key of Object.keys(spec.input ?? {})) if (input[key] !== undefined) params[key] = input[key];
+  return params;
+}
+
+function withScopes(description: string, scopes: ScopeRequirement): string {
+  return `${description} Tesla scope: ${describeScopes(scopes)}.`;
+}
+
+/** Turn a catalog spec into a tool: shared inputs, annotations, and, for
+ * anything that changes a vehicle or energy product, the confirmation gate. */
+function catalogTool(owner: OwnerStub, spec: ToolSpec): ToolDefinition {
+  const target = spec.kind === "signed" ? "vehicle" : FLEET_ENDPOINTS[spec.endpoint].target;
+  const mutates = spec.kind === "signed" || FLEET_ENDPOINTS[spec.endpoint].mutates;
+  const scopes = spec.kind === "signed" ? signedCommandScopes(spec.command) : endpointScopes(spec.endpoint, {});
+  const inputSchema = z
+    .object({
+      ...(target === "vehicle" ? { vehicle_id: vehicleId } : {}),
+      ...(target === "energy_site" ? { energy_site_id: energySiteId } : {}),
+      ...spec.input,
+      ...(mutates ? { confirm, dryRun } : {}),
+    })
+    .strict();
+  const annotations = mutates
+    ? { ...COMMAND, destructiveHint: spec.destructive === true, idempotentHint: spec.idempotent !== false }
+    : READ;
+  const auditAction = spec.kind === "signed" ? spec.command : spec.endpoint;
+  const where = (input: Record<string, unknown>) => ({
+    vehicleId: input.vehicle_id as string | undefined,
+    energySiteId: input.energy_site_id as string | undefined,
+  });
+
+  const run = async (input: Record<string, unknown>): Promise<CallToolResult> => {
+    const params = specParams(spec, input);
+    if (spec.kind === "signed") {
+      const sent = await owner.signedVehicleCommand({
+        command: spec.command,
+        params,
+        vehicleId: where(input).vehicleId,
+      });
+      if (!sent.ok) return failure(sent.error);
+      return result({ summary: summaryText(spec.done, input), vehicleId: sent.data.vehicleId });
+    }
+    // The stub's mapped type cannot express `unknown` JSON; structured clone
+    // returns exactly what OwnerState produced.
+    const called = (await owner.fleetEndpoint(spec.endpoint, {
+      ...where(input),
+      params,
+    })) as OwnerResult<EndpointSuccess>;
+    if (!called.ok) return failure(called.error);
+    const { data, vehicleId: resolvedVehicle, energySiteId: resolvedSite } = called.data;
+    return result({
+      summary: summaryText(spec.done, input),
+      ...(resolvedVehicle ? { vehicleId: resolvedVehicle } : {}),
+      ...(resolvedSite ? { energySiteId: resolvedSite } : {}),
+      data: data ?? null,
+    });
+  };
+
+  return {
+    name: spec.name,
+    description: withScopes(
+      mutates ? `${spec.description} Requires confirm set to true after the user asks.` : spec.description,
+      spec.kind === "endpoint" && spec.endpoint === "vehicle_data" ? { ...scopes, also: "vehicle_location" } : scopes,
+    ).replace(", plus vehicle_location.", " (plus vehicle_location for location_data)."),
+    inputSchema,
+    annotations,
+    ...(spec.dangerousAction ? { dangerousAction: spec.dangerousAction } : {}),
+    scopes,
+    handler: mutates
+      ? (input) => {
+          const action = spec.kind === "signed" ? spec.action : (spec.action ?? spec.name);
+          return commandGate(owner, auditAction, input, summaryText(action, input), () => run(input));
+        }
+      : run,
+  };
 }
 
 export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
@@ -104,9 +205,10 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_vehicles_list",
       description:
-        "List the cars on the owner's Tesla account with their id, name, and whether each is online, asleep, or offline. Does not wake any car.",
+        "List the cars on the owner's Tesla account with their id, name, and whether each is online, asleep, or offline. Does not wake any car. Tesla scope: vehicle_device_data.",
       inputSchema: z.object({}).strict(),
       annotations: READ,
+      scopes: READ_SCOPES,
       handler: async () => {
         const listed = await owner.listVehicles();
         if (!listed.ok) return failure(listed.error);
@@ -124,9 +226,10 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_vehicle_status",
       description:
-        "Get the car's current status: online or asleep, and when online whether it is locked, which doors, trunks, or windows are open, battery percent, range, charging state, inside and outside temperature, climate, Sentry Mode, and odometer. Never wakes the car; if it is asleep, says so.",
+        "Get the car's current status: online or asleep, and when online whether it is locked, which doors, trunks, or windows are open, battery percent, range, charging state, inside and outside temperature, climate, Sentry Mode, and odometer. Never wakes the car; if it is asleep, says so. Tesla scope: vehicle_device_data.",
       inputSchema: z.object({ vehicle_id: vehicleId }).strict(),
       annotations: READ,
+      scopes: READ_SCOPES,
       handler: async (input) => {
         const status = await owner.vehicleStatus(input.vehicle_id as string | undefined);
         if (!status.ok) return failure(status.error);
@@ -149,9 +252,10 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_wake",
       description:
-        "Wake the car so it can report status or take commands. Requires confirm set to true after the user asks. Waking uses a little battery; the car usually comes online within 30 seconds.",
+        "Wake the car so it can report status or take commands. Requires confirm set to true after the user asks. Waking uses a little battery; the car usually comes online within 30 seconds. Tesla scope: vehicle_cmds.",
       inputSchema: z.object({ vehicle_id: vehicleId, confirm, dryRun }).strict(),
       annotations: COMMAND,
+      scopes: COMMAND_SCOPES,
       handler: (input) =>
         commandGate(owner, "wake", input, "wake the car", async () => {
           const woke = await owner.wake({ vehicleId: input.vehicle_id as string | undefined });
@@ -169,9 +273,10 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_lock",
       description:
-        "Lock the car's doors with a signed command. Wakes the car if it is asleep, waits for it to come online, retries, and reads the lock state back; can take a few minutes when the car is asleep. Requires confirm set to true after the user asks. Locking an already locked car is fine. On failure, `reason` says why (for example pairing_required, wake_timeout, still_unlocked).",
+        "Lock the car's doors with a signed command. Wakes the car if it is asleep, waits for it to come online, retries, and reads the lock state back; can take a few minutes when the car is asleep. Requires confirm set to true after the user asks. Locking an already locked car is fine. On failure, `reason` says why (for example pairing_required, wake_timeout, still_unlocked). Tesla scope: vehicle_cmds.",
       inputSchema: z.object({ vehicle_id: vehicleId, confirm, dryRun }).strict(),
       annotations: COMMAND,
+      scopes: COMMAND_SCOPES,
       handler: (input) =>
         commandGate(owner, "lock", input, "lock the car", async () => {
           const locked = await owner.lock({ vehicleId: input.vehicle_id as string | undefined });
@@ -227,6 +332,25 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
         });
       },
     },
+    {
+      ...PING_TOOL,
+      description: withScopes(PING_TOOL.description, signedCommandScopes("ping")),
+      inputSchema: z.object({ vehicle_id: vehicleId }).strict(),
+      annotations: READ,
+      scopes: signedCommandScopes("ping"),
+      handler: async (input) => {
+        const pinged = await owner.signedVehicleCommand({
+          command: "ping",
+          vehicleId: input.vehicle_id as string | undefined,
+        });
+        if (!pinged.ok) return failure(pinged.error);
+        return result({
+          summary: "The car is online and accepted a signed command.",
+          vehicleId: pinged.data.vehicleId,
+        });
+      },
+    },
+    ...CATALOG.map((spec) => catalogTool(owner, spec)),
   ];
 }
 
