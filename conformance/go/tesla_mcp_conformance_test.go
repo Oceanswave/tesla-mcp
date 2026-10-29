@@ -4,8 +4,11 @@
 // checkout of github.com/teslamotors/vehicle-command, because Tesla's signer
 // lives in internal packages that cannot be imported from outside the module.
 // It rebuilds every value in test/vectors/vcsec-lock.json with Tesla's own code
-// and requires byte equality. The TypeScript tests assert the same file, so a
-// pass proves the Worker's signer is byte-compatible with Tesla's.
+// and requires byte equality. conformance/run.sh runs it once per vectors file:
+// test/vectors/vcsec-lock.json (VCSEC) and test/vectors/infotainment-honk.json
+// (infotainment, whose request hash keeps the full HMAC tag and whose replies
+// are encrypted). The TypeScript tests assert the same files, so a pass proves
+// the Worker's signer is byte-compatible with Tesla's in both domains.
 //
 // The keys are the private scalars 1 (client) and 2 (vehicle): public test
 // values, never real credentials.
@@ -27,6 +30,7 @@ import (
 	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 
+	carserver "github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/carserver"
 	"github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/signatures"
 	universal "github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/universalmessage"
 	"github.com/teslamotors/vehicle-command/pkg/protocol/protobuf/vcsec"
@@ -83,6 +87,7 @@ type conformanceVectors struct {
 		SessionInfoTag hexBytes `json:"session_info_tag"`
 	} `json:"handshake"`
 	LockPayload hexBytes             `json:"lock_payload"`
+	HonkPayload hexBytes             `json:"honk_payload"`
 	Commands    []conformanceCommand `json:"commands"`
 	Response    struct {
 		Counter         uint32   `json:"counter"`
@@ -113,7 +118,7 @@ func loadConformanceVectors(t *testing.T) *conformanceVectors {
 	t.Helper()
 	path := os.Getenv("TESLA_MCP_VECTORS")
 	if path == "" {
-		t.Fatal("TESLA_MCP_VECTORS must point at test/vectors/vcsec-lock.json")
+		t.Fatal("TESLA_MCP_VECTORS must point at a vectors file in test/vectors")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -202,6 +207,15 @@ func expectMessage(t *testing.T, name string, message proto.Message, want []byte
 	}
 }
 
+// commandPayload is the command these vectors sign: door lock for VCSEC,
+// honk for infotainment.
+func commandPayload(v *conformanceVectors) []byte {
+	if universal.Domain(v.Inputs.Domain) == universal.Domain_DOMAIN_INFOTAINMENT {
+		return v.HonkPayload
+	}
+	return v.LockPayload
+}
+
 // commandMessage mirrors vehicle.getReceiver plus the addressing that
 // dispatcher.Send adds (random routing address and UUID, pinned here).
 func commandMessage(v *conformanceVectors, command conformanceCommand) *universal.RoutableMessage {
@@ -212,7 +226,7 @@ func commandMessage(v *conformanceVectors, command conformanceCommand) *universa
 		FromDestination: &universal.Destination{
 			SubDestination: &universal.Destination_RoutingAddress{RoutingAddress: v.Inputs.RoutingAddress},
 		},
-		Payload: &universal.RoutableMessage_ProtobufMessageAsBytes{ProtobufMessageAsBytes: v.LockPayload},
+		Payload: &universal.RoutableMessage_ProtobufMessageAsBytes{ProtobufMessageAsBytes: commandPayload(v)},
 		Uuid:    command.CommandUUID,
 		Flags:   command.Flags,
 	}
@@ -221,8 +235,9 @@ func commandMessage(v *conformanceVectors, command conformanceCommand) *universa
 func TestTeslaMCPConformance(t *testing.T) {
 	v := loadConformanceVectors(t)
 	vin := []byte(v.Inputs.VIN)
-	if universal.Domain(v.Inputs.Domain) != universal.Domain_DOMAIN_VEHICLE_SECURITY {
-		t.Fatalf("vectors target domain %d, expected VCSEC", v.Inputs.Domain)
+	domain := universal.Domain(v.Inputs.Domain)
+	if domain != universal.Domain_DOMAIN_VEHICLE_SECURITY && domain != universal.Domain_DOMAIN_INFOTAINMENT {
+		t.Fatalf("vectors target domain %d, expected VCSEC or infotainment", v.Inputs.Domain)
 	}
 	client := scalarKey(t, v.Inputs.ClientScalar)
 	vehicle := scalarKey(t, v.Inputs.VehicleScalar)
@@ -292,7 +307,17 @@ func TestTeslaMCPConformance(t *testing.T) {
 		t.Fatal("handshake failed; cannot sign commands")
 	}
 
-	t.Run("LockPayload", func(t *testing.T) {
+	t.Run("Payload", func(t *testing.T) {
+		if domain == universal.Domain_DOMAIN_INFOTAINMENT {
+			// pkg/vehicle HonkHorn
+			payload := &carserver.Action{ActionMsg: &carserver.Action_VehicleAction{VehicleAction: &carserver.VehicleAction{
+				VehicleActionMsg: &carserver.VehicleAction_VehicleControlHonkHornAction{
+					VehicleControlHonkHornAction: &carserver.VehicleControlHonkHornAction{},
+				},
+			}}}
+			expectBytes(t, "CarServer honk payload", marshal(t, payload), v.HonkPayload)
+			return
+		}
 		payload := &vcsec.UnsignedMessage{
 			SubMessage: &vcsec.UnsignedMessage_RKEAction{RKEAction: vcsec.RKEAction_E_RKE_ACTION_LOCK},
 		}
@@ -307,7 +332,7 @@ func TestTeslaMCPConformance(t *testing.T) {
 	verifier.counter = v.Inputs.SessionCounter
 	verifier.timeZero = time.Now().Add(-time.Duration(v.Inputs.ClockTime) * time.Second)
 
-	var lockMessage *universal.RoutableMessage
+	var boundMessage *universal.RoutableMessage
 	for _, command := range v.Commands {
 		t.Run(fmt.Sprintf("SignedCommand/counter=%d/flags=%d", command.Counter, command.Flags), func(t *testing.T) {
 			if command.ExpiresAt != v.Inputs.ClockTime+v.Inputs.TTLSeconds {
@@ -357,22 +382,23 @@ func TestTeslaMCPConformance(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Tesla's Verifier rejected the vector command: %v", err)
 			}
-			expectBytes(t, "verified payload", plaintext, v.LockPayload)
+			expectBytes(t, "verified payload", plaintext, commandPayload(v))
 			if _, err := verifier.Verify(&received); err == nil {
 				t.Error("Tesla's Verifier accepted a replayed counter")
 			}
-			if command.Flags == 0 && lockMessage == nil {
-				lockMessage = &received
+			// The encrypted response vector answers the first command.
+			if boundMessage == nil {
+				boundMessage = &received
 			}
 		})
 	}
-	if lockMessage == nil {
-		t.Fatal("no verified flags-0 lock command to bind the response to")
+	if boundMessage == nil {
+		t.Fatal("no verified command to bind the response to")
 	}
 
 	t.Run("EncryptedResponse", func(t *testing.T) {
 		r := v.Response
-		requestID := RequestID(lockMessage)
+		requestID := RequestID(boundMessage)
 		response := &universal.RoutableMessage{
 			ToDestination: &universal.Destination{
 				SubDestination: &universal.Destination_RoutingAddress{RoutingAddress: v.Inputs.RoutingAddress},
@@ -381,7 +407,7 @@ func TestTeslaMCPConformance(t *testing.T) {
 				SubDestination: &universal.Destination_Domain{Domain: universal.Domain(v.Inputs.Domain)},
 			},
 			Payload:     &universal.RoutableMessage_ProtobufMessageAsBytes{ProtobufMessageAsBytes: r.Plaintext},
-			RequestUuid: lockMessage.GetUuid(),
+			RequestUuid: boundMessage.GetUuid(),
 			Flags:       r.Flags,
 		}
 		if r.Fault != 0 {

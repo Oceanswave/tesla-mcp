@@ -1,0 +1,53 @@
+{
+  "description": "Infotainment (CarServer) honk vectors shared by test/vcp-vectors.test.ts and conformance/go (Tesla's vehicle-command). Same public test scalars 1 and 2 and inputs as vcsec-lock.json, but domain 3: the response request hash keeps the full 32-byte HMAC tag and replies are AES-GCM encrypted. Nothing here is a real credential.",
+  "inputs": {
+    "client_scalar": 1,
+    "vehicle_scalar": 2,
+    "vin": "5YJ3E1EA1NF000001",
+    "domain": 3,
+    "epoch": "000102030405060708090a0b0c0d0e0f",
+    "routing_address": "202122232425262728292a2b2c2d2e2f",
+    "handshake_uuid": "404142434445464748494a4b4c4d4e4f",
+    "session_counter": 7,
+    "clock_time": 1000,
+    "ttl_seconds": 15
+  },
+  "derived": {
+    "client_public_point": "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5",
+    "vehicle_public_point": "047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d1",
+    "ecdh_sha1_128": "b59d61fedc3b7a1ee22fde1780a59522",
+    "hmac_command": "62bae25f96a2ec94e54651e6b0ca389c56d230f6bbf5a1b21fef11d12cf7d44b",
+    "hmac_session_info": "45b2513c0595df7bf4a8313e3c654835446cf99fbb979ff9864447000da07567"
+  },
+  "handshake": {
+    "request": "320208033a121210202122232425262728292a2b2c2d2e2f72430a41046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f59a0310404142434445464748494a4b4c4d4e4f",
+    "session_info": "08071241047cf27b188d034f7e8a52380304b51ac3c08969e277f21b35a60b48fc4766997807775510db8ed040293d9ac69f7430dbba7dade63ce982299e04b79d227873d11a10000102030405060708090a0b0c0d0e0f25e8030000",
+    "session_info_tag": "397a81d849eaacd4da2fc0072a3e0ff91085c094ebc2817d5856e2e04cca2366"
+  },
+  "honk_payload": "1203da0100",
+  "commands": [
+    {
+      "description": "honk_horn as this Worker sends it (FLAG_ENCRYPT_RESPONSE, Tesla's default)",
+      "counter": 8,
+      "expires_at": 1015,
+      "flags": 2,
+      "command_uuid": "303132333435363738393a3b3c3d3e3f",
+      "metadata": "000108010103021135594a3345314541314e463030303030310310000102030405060708090a0b0c0d0e0f0404000003f7050400000008070400000002",
+      "tag": "73b121aab5f54223101488a2d329e2221789dcf6eb50c3f02f428ec8677d5fa9",
+      "routable_message": "320208033a121210202122232425262728292a2b2c2d2e2f52051203da01006a82010a430a41046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5423b0a10000102030405060708090a0b0c0d0e0f10081df7030000222073b121aab5f54223101488a2d329e2221789dcf6eb50c3f02f428ec8677d5fa99a0310303132333435363738393a3b3c3d3e3fa00302",
+      "request_hash": "0873b121aab5f54223101488a2d329e2221789dcf6eb50c3f02f428ec8677d5fa9"
+    }
+  ],
+  "encrypted_response": {
+    "description": "AES-GCM CarServer.Response { actionStatus { result: OK } } to the honk, as Tesla's Verifier.Encrypt builds it but with a fixed nonce",
+    "counter": 1,
+    "flags": 0,
+    "fault": 0,
+    "nonce": "606162636465666768696a6b",
+    "plaintext": "0a00",
+    "metadata": "000109010103021135594a3345314541314e4630303030303105040000000107040000000008210873b121aab5f54223101488a2d329e2221789dcf6eb50c3f02f428ec8677d5fa9090400000000",
+    "ciphertext": "f27c",
+    "tag": "33c55a6a71164acebe74ff4498ce29b6",
+    "routable_message": "32121210202122232425262728292a2b2c2d2e2f3a0208035202f27c6a244a220a0c606162636465666768696a6b10011a1033c55a6a71164acebe74ff4498ce29b6920310303132333435363738393a3b3c3d3e3f"
+  }
+}

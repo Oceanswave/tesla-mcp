@@ -18,16 +18,20 @@ import {
   sha256Digest,
   type VcpKeyMaterial,
 } from "./crypto";
+import { CommandParamError, type CommandParams } from "./payloads";
 import {
   buildSessionInfoRequest,
   buildSignedCommand,
+  DOMAIN_INFOTAINMENT,
   DOMAIN_VEHICLE_SECURITY,
   encodeCommandMetadata,
   encodeResponseMetadata,
   encodeSessionInfoMetadata,
+  FLAG_ENCRYPT_RESPONSE,
   isSignedCommandName,
   MESSAGE_FAULT,
   OPERATION_STATUS,
+  parseCarServerResult,
   parseRoutableResponse,
   parseSessionInfo,
   parseVcsecResult,
@@ -101,6 +105,8 @@ export class VcpError extends Error {
     /** Sanitized protocol stage for logs and audit. Never contains a VIN,
      * token, key, or payload. */
     readonly stage?: string,
+    /** The car's own short, printable failure reason, when it gave one. */
+    readonly reason?: string,
   ) {
     super(`tesla_vcp_${code}`);
     this.name = "VcpError";
@@ -111,11 +117,13 @@ export type SignedCommandRequest = {
   vin: string;
   accessToken: string;
   command: SignedCommandName;
+  /** The command's parameters, checked by its payload builder. */
+  params?: CommandParams;
 };
 
 export type SignedCommandResult =
   | { ok: true }
-  | { ok: false; error: { code: VcpErrorCode; retryable: boolean; stage: string } };
+  | { ok: false; error: { code: VcpErrorCode; retryable: boolean; stage: string; reason?: string } };
 
 type Session = {
   responseEncryptionKey: Uint8Array;
@@ -207,8 +215,18 @@ export class TeslaVcpCore {
     ) {
       throw new VcpError("invalid_request", false, "request_validation");
     }
+    let payload: Uint8Array;
+    try {
+      payload = SIGNED_COMMANDS[request.command].payload(request.params ?? {});
+    } catch (error) {
+      throw new VcpError(
+        "invalid_request",
+        false,
+        error instanceof CommandParamError ? `param_${error.param}` : "payload_build",
+      );
+    }
     this.vin = request.vin;
-    await this.sendSigned(request.accessToken, request.command, false, 1);
+    await this.sendSigned(request.accessToken, request.command, payload, false, 1);
   }
 
   private checkedRandom16(): Uint8Array {
@@ -230,6 +248,7 @@ export class TeslaVcpCore {
   private async sendSigned(
     accessToken: string,
     command: SignedCommandName,
+    payload: Uint8Array,
     sessionRetryUsed: boolean,
     attempt: number,
   ): Promise<void> {
@@ -241,7 +260,7 @@ export class TeslaVcpCore {
     if (session.counter >= 0xffff_ffff) {
       this.sessions.delete(domain);
       if (sessionRetryUsed) throw new VcpError("session_unavailable", false, "counter_exhausted");
-      return this.sendSigned(accessToken, command, true, attempt);
+      return this.sendSigned(accessToken, command, payload, true, attempt);
     }
 
     session.counter += 1;
@@ -250,7 +269,6 @@ export class TeslaVcpCore {
       this.sessions.delete(domain);
       throw new VcpError("session_unavailable", false, "expiry_range");
     }
-    const payload = spec.payload();
     const metadata = encodeCommandMetadata({
       vin,
       epoch: session.epoch,
@@ -347,13 +365,22 @@ export class TeslaVcpCore {
 
     if (response.fault === MESSAGE_FAULT.NONE) {
       if (response.operationStatus === OPERATION_STATUS.WAIT) {
-        return this.retryUnexecuted(accessToken, command, sessionRetryUsed, attempt, "operation_wait");
+        return this.retryUnexecuted(accessToken, command, payload, sessionRetryUsed, attempt, "operation_wait");
       }
       if (response.operationStatus !== OPERATION_STATUS.OK) {
         throw new VcpError("command_rejected", false, `operation_status_${response.operationStatus}`);
       }
-      // Only VCSEC commands exist today; an infotainment command would decode
-      // a CarServer.Response here instead.
+      if (spec.flags & FLAG_ENCRYPT_RESPONSE && !response.hasResponseEncryptionData) {
+        // A plaintext success to a request that asked for encryption is not
+        // bound to this request; never trust it.
+        throw new VcpError("status_unknown", false, "response_not_encrypted");
+      }
+      if (domain === DOMAIN_INFOTAINMENT) {
+        const result = parseCarServerResult(responsePayload);
+        if (result.status === "ok") return;
+        if (result.status === "unknown") throw new VcpError("status_unknown", false, "carserver_response_decode");
+        throw new VcpError("command_rejected", false, "carserver_error", result.reason);
+      }
       const result = parseVcsecResult(responsePayload);
       if (result.status === "ok") {
         // A plaintext completion without a request UUID is matched only by a
@@ -370,7 +397,7 @@ export class TeslaVcpCore {
         throw new VcpError("status_unknown", false, "vcsec_acknowledged");
       }
       if (result.status === "wait") {
-        return this.retryUnexecuted(accessToken, command, sessionRetryUsed, attempt, "vcsec_wait");
+        return this.retryUnexecuted(accessToken, command, payload, sessionRetryUsed, attempt, "vcsec_wait");
       }
       if (result.status === "unknown") {
         throw new VcpError("status_unknown", false, "vcsec_response_decode");
@@ -384,7 +411,7 @@ export class TeslaVcpCore {
         if (sessionRetryUsed) {
           throw new VcpError("session_unavailable", false, `vcsec_information_${result.information}`);
         }
-        return this.sendSigned(accessToken, command, true, attempt);
+        return this.sendSigned(accessToken, command, payload, true, attempt);
       }
       throw new VcpError(
         "command_rejected",
@@ -404,7 +431,7 @@ export class TeslaVcpCore {
     if (STALE_SESSION_FAULTS.has(response.fault)) {
       this.sessions.delete(domain);
       if (sessionRetryUsed) throw new VcpError("session_unavailable", false, stage);
-      return this.sendSigned(accessToken, command, true, attempt);
+      return this.sendSigned(accessToken, command, payload, true, attempt);
     }
     if (DEFINITIVE_REJECTIONS.has(response.fault)) {
       throw new VcpError("command_rejected", false, stage);
@@ -414,7 +441,7 @@ export class TeslaVcpCore {
       throw new VcpError("remote_access_required", false, stage);
     }
     if (TRANSIENT_FAULTS.has(response.fault)) {
-      return this.retryUnexecuted(accessToken, command, sessionRetryUsed, attempt, stage);
+      return this.retryUnexecuted(accessToken, command, payload, sessionRetryUsed, attempt, stage);
     }
     throw new VcpError("session_unavailable", false, stage);
   }
@@ -425,6 +452,7 @@ export class TeslaVcpCore {
   private async retryUnexecuted(
     accessToken: string,
     command: SignedCommandName,
+    payload: Uint8Array,
     sessionRetryUsed: boolean,
     attempt: number,
     stage: string,
@@ -433,7 +461,7 @@ export class TeslaVcpCore {
       throw new VcpError("vehicle_unavailable", true, `${stage}_exhausted`);
     }
     await this.sleep(COMMAND_RETRY_INTERVAL_MS);
-    return this.sendSigned(accessToken, command, sessionRetryUsed, attempt + 1);
+    return this.sendSigned(accessToken, command, payload, sessionRetryUsed, attempt + 1);
   }
 
   /** Is this reply for the request with `uuid`? A request UUID, when present,
@@ -575,7 +603,12 @@ export function toSignedCommandResult(error: unknown): SignedCommandResult {
   const typed = error instanceof VcpError ? error : new VcpError("service_unavailable", false, "internal");
   return {
     ok: false,
-    error: { code: typed.code, retryable: typed.retryable, stage: typed.stage ?? "unspecified" },
+    error: {
+      code: typed.code,
+      retryable: typed.retryable,
+      stage: typed.stage ?? "unspecified",
+      ...(typed.reason ? { reason: typed.reason } : {}),
+    },
   };
 }
 

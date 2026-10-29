@@ -1,39 +1,217 @@
 # tesla-mcp
 
 A private [Model Context Protocol](https://modelcontextprotocol.io) server for one Tesla owner, running on
-Cloudflare Workers. It gives an assistant, or any Streamable HTTP MCP client or script, plain tools to check the car
-and lock it. The server has no schedules or routines of its own: anything recurring, such as a nightly lock, is run
-by the caller (see [Locking on a schedule](#locking-on-a-schedule)).
+Cloudflare Workers. It gives an assistant, or any Streamable HTTP MCP client or script, plain tools for the owner's
+Tesla vehicles, energy products (Powerwall, solar, Wall Connector), and account: status and data, climate, charging,
+closures, media, security settings, navigation, and energy settings. The server has no schedules or routines of its
+own: anything recurring, such as a nightly lock, is run by the caller (see
+[Locking on a schedule](#locking-on-a-schedule)).
 
-Lock is sent as a signed Vehicle Command Protocol message (the VCSEC domain), so it works on vehicles that require
-Tesla's command signing. The signer is a WebCrypto port checked byte for byte against the hermes-tescmd-plugin
-Python implementation and against Tesla's Go implementation.
+Vehicle commands are sent as signed Vehicle Command Protocol messages (VCSEC for locks and closures, infotainment for
+the rest), so they work on vehicles that require Tesla's command signing. The signer is a WebCrypto port checked byte
+for byte against Tesla's Go implementation: every command payload, both domains' handshakes and signatures, and the
+encrypted replies. [GAP.md](GAP.md) maps every Tesla capability to a tool, or says why there is none.
 
 **Status: owner-only MVP.** One owner, one static bearer token, one Tesla account. Multi-user sign-in with Tesla
 OAuth is planned; the auth and storage seams are already in place for it.
 
 ## Tools
 
-| Tool                   | Kind    | What it does                                                                                                                                                                |
-| ---------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tesla_vehicles_list`  | read    | Cars on the account with id, name, and online/asleep/offline.                                                                                                               |
-| `tesla_vehicle_status` | read    | Online or asleep; when online: locked, open doors/trunks/windows, battery, range, charging, temperatures, climate, Sentry Mode, odometer. Never wakes the car. No location. |
-| `tesla_wake`           | command | Wake the car.                                                                                                                                                               |
-| `tesla_lock`           | command | Lock the doors with a signed command. Wakes the car, waits for it, retries, and reads the lock state back.                                                                  |
-| `tesla_auth_status`    | read    | Tesla sign-in state: `ok`, `reauth_required`, or `not_configured`. Reads stored state only; never contacts Tesla.                                                           |
-| `tesla_audit_recent`   | read    | Newest audit log entries (default 20).                                                                                                                                      |
+126 tools. **101** are registered by default; the **25** marked dangerous exist only when
+`DANGEROUS_COMMANDS_ENABLED` is `"true"`. Every _command_ needs `confirm: true` and accepts `dryRun: true`; _read_
+tools take neither and never wake the car. Vehicle tools take an optional `vehicle_id` and energy tools an optional
+`energy_site_id` (left out, the account's only car or site is used). Each tool's description names the Tesla OAuth
+scope it needs; see [Scopes](#scopes).
+
+### Core
+
+| Tool                   | Kind    | What it does                                                                                                                                                                                                                                |
+| ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tesla_vehicles_list`  | read    | List the cars on the owner's Tesla account with their id, name, and whether each is online, asleep, or offline.                                                                                                                             |
+| `tesla_vehicle_status` | read    | Get the car's current status: online or asleep, and when online whether it is locked, which doors, trunks, or windows are open, battery percent, range, charging state, inside and outside temperature, climate, Sentry Mode, and odometer. |
+| `tesla_wake`           | command | Wake the car so it can report status or take commands.                                                                                                                                                                                      |
+| `tesla_lock`           | command | Lock the car's doors with a signed command.                                                                                                                                                                                                 |
+| `tesla_auth_status`    | read    | Report whether the server's Tesla sign-in works: authState is ok, reauth_required (Tesla rejected the sign-in; the owner must set a new refresh token), or not_configured.                                                                  |
+| `tesla_audit_recent`   | read    | Show the most recent entries in the audit log of commands, wakes, and sign-in events, newest first.                                                                                                                                         |
+| `tesla_vehicle_ping`   | read    | Check that the car is online and accepts this server's signed commands (its virtual key is paired) by sending a signed no-op.                                                                                                               |
+
+### Doors, closures, and alerts
+
+| Tool                  | Kind                   | What it does                                                                    |
+| --------------------- | ---------------------- | ------------------------------------------------------------------------------- |
+| `tesla_unlock`        | command, **dangerous** | Unlock the car's doors.                                                         |
+| `tesla_remote_start`  | command, **dangerous** | Enable keyless driving (remote start) for two minutes.                          |
+| `tesla_auto_secure`   | command                | Close the powered doors and lock the car (Model X falcon-wing and front doors). |
+| `tesla_trunk_open`    | command, **dangerous** | Open the rear trunk.                                                            |
+| `tesla_trunk_close`   | command                | Close a powered rear trunk.                                                     |
+| `tesla_frunk_open`    | command, **dangerous** | Open the front trunk (frunk).                                                   |
+| `tesla_tonneau_open`  | command, **dangerous** | Open the powered tonneau cover (Cybertruck).                                    |
+| `tesla_tonneau_close` | command                | Close the powered tonneau cover (Cybertruck).                                   |
+| `tesla_tonneau_stop`  | command                | Stop a moving tonneau cover (Cybertruck).                                       |
+| `tesla_windows_vent`  | command, **dangerous** | Vent (slightly open) all windows.                                               |
+| `tesla_windows_close` | command                | Close all windows.                                                              |
+| `tesla_sunroof_vent`  | command, **dangerous** | Vent the sunroof, on cars with a powered sunroof.                               |
+| `tesla_sunroof_close` | command                | Close the sunroof, on cars with a powered sunroof.                              |
+| `tesla_honk_horn`     | command                | Honk the horn once.                                                             |
+| `tesla_flash_lights`  | command                | Flash the headlights once.                                                      |
+
+### Climate and seats
+
+| Tool                                           | Kind    | What it does                                                                         |
+| ---------------------------------------------- | ------- | ------------------------------------------------------------------------------------ |
+| `tesla_climate_start`                          | command | Turn on climate control (precondition the cabin) at the current settings.            |
+| `tesla_climate_stop`                           | command | Turn off climate control.                                                            |
+| `tesla_climate_set_temperatures`               | command | Set the driver and passenger cabin temperatures, in Celsius (15-28).                 |
+| `tesla_climate_set_preconditioning_max`        | command | Turn Defrost (maximum preconditioning) on or off.                                    |
+| `tesla_climate_set_bioweapon_mode`             | command | Turn Bioweapon Defense Mode on or off, on cars with a HEPA filter.                   |
+| `tesla_climate_set_cabin_overheat_protection`  | command | Turn Cabin Overheat Protection on or off, optionally fan only (no A/C).              |
+| `tesla_climate_set_cabin_overheat_temperature` | command | Set the temperature at which Cabin Overheat Protection starts: low, medium, or high. |
+| `tesla_climate_set_keeper_mode`                | command | Set Climate Keeper: off, on (Keep), dog (Dog Mode), or camp (Camp Mode).             |
+| `tesla_seat_heater_set`                        | command | Set seat heater levels for one or more seats.                                        |
+| `tesla_seat_cooler_set`                        | command | Set a front seat's ventilation (cooling) level, on cars with ventilated seats.       |
+| `tesla_seat_auto_climate_set`                  | command | Turn automatic seat heating and cooling on or off for a front seat.                  |
+| `tesla_steering_wheel_heater_set`              | command | Turn the steering wheel heater on or off.                                            |
+
+### Charging and schedules
+
+| Tool                                     | Kind                   | What it does                                                                                         |
+| ---------------------------------------- | ---------------------- | ---------------------------------------------------------------------------------------------------- |
+| `tesla_charge_start`                     | command                | Start charging.                                                                                      |
+| `tesla_charge_stop`                      | command                | Stop charging.                                                                                       |
+| `tesla_charge_standard`                  | command                | Set the charge limit to the car's standard (daily) level.                                            |
+| `tesla_charge_max_range`                 | command                | Set the charge limit to maximum range (100%), for trips.                                             |
+| `tesla_charge_set_limit`                 | command                | Set the charge limit, 50 to 100 percent.                                                             |
+| `tesla_charge_set_amps`                  | command                | Set the charging current in amps (1-80).                                                             |
+| `tesla_charge_port_open`                 | command, **dangerous** | Open the charge port door.                                                                           |
+| `tesla_charge_port_close`                | command                | Close the charge port door.                                                                          |
+| `tesla_charge_set_scheduled_charging`    | command                | Set or turn off the single scheduled charging start time.                                            |
+| `tesla_charge_set_scheduled_departure`   | command                | Set the scheduled departure: the car preconditions and/or charges off-peak to be ready by this time. |
+| `tesla_charge_clear_scheduled_departure` | command                | Turn off scheduled departure.                                                                        |
+| `tesla_charge_schedule_add`              | command                | Add or replace a charge schedule (firmware 2024.26+).                                                |
+| `tesla_charge_schedule_remove`           | command                | Remove one charge schedule by id.                                                                    |
+| `tesla_charge_schedules_remove`          | command                | Remove all charge schedules at home, work, and/or other locations.                                   |
+| `tesla_precondition_schedule_add`        | command                | Add or replace a cabin preconditioning schedule (firmware 2024.26+), applied at the given location.  |
+| `tesla_precondition_schedule_remove`     | command                | Remove one preconditioning schedule by id.                                                           |
+| `tesla_precondition_schedules_remove`    | command                | Remove all preconditioning schedules at home, work, and/or other locations.                          |
+
+### Media and power
+
+| Tool                             | Kind    | What it does                                                                      |
+| -------------------------------- | ------- | --------------------------------------------------------------------------------- |
+| `tesla_low_power_mode_set`       | command | Turn Low Power Mode on or off (Cybertruck).                                       |
+| `tesla_keep_accessory_power_set` | command | Turn Keep Accessory Power on or off (keeps 12 V outlets and accessories powered). |
+| `tesla_media_set_volume`         | command | Set the media volume, 0 to 10.                                                    |
+| `tesla_media_volume_up`          | command | Turn the media volume up one step.                                                |
+| `tesla_media_volume_down`        | command | Turn the media volume down one step.                                              |
+| `tesla_media_toggle_playback`    | command | Play or pause media.                                                              |
+| `tesla_media_next_track`         | command | Skip to the next track.                                                           |
+| `tesla_media_previous_track`     | command | Go to the previous track.                                                         |
+| `tesla_media_next_favorite`      | command | Go to the next favorite station.                                                  |
+| `tesla_media_previous_favorite`  | command | Go to the previous favorite station.                                              |
+
+### Security, access, and settings
+
+| Tool                                | Kind                   | What it does                                                                                      |
+| ----------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------- |
+| `tesla_sentry_mode_on`              | command                | Turn Sentry Mode on.                                                                              |
+| `tesla_sentry_mode_off`             | command, **dangerous** | Turn Sentry Mode off.                                                                             |
+| `tesla_valet_mode_on`               | command, **dangerous** | Turn Valet Mode on with a four-digit PIN.                                                         |
+| `tesla_valet_mode_off`              | command, **dangerous** | Turn Valet Mode off.                                                                              |
+| `tesla_valet_pin_reset`             | command, **dangerous** | Clear the Valet Mode PIN.                                                                         |
+| `tesla_pin_to_drive_set`            | command, **dangerous** | Turn PIN to Drive on (with a new four-digit PIN) or off (with the current PIN).                   |
+| `tesla_pin_to_drive_reset`          | command, **dangerous** | Reset the PIN to Drive PIN (owner and fleet manager only).                                        |
+| `tesla_pin_to_drive_clear_admin`    | command, **dangerous** | Turn off PIN to Drive and clear its PIN without the PIN (owner and fleet manager only).           |
+| `tesla_speed_limit_activate`        | command, **dangerous** | Turn Speed Limit Mode on with its four-digit PIN.                                                 |
+| `tesla_speed_limit_deactivate`      | command, **dangerous** | Turn Speed Limit Mode off with its four-digit PIN.                                                |
+| `tesla_speed_limit_set`             | command, **dangerous** | Set the Speed Limit Mode maximum speed, 50 to 120 mph.                                            |
+| `tesla_speed_limit_clear_pin`       | command, **dangerous** | Clear the Speed Limit Mode PIN (also turns Speed Limit Mode off).                                 |
+| `tesla_speed_limit_clear_pin_admin` | command, **dangerous** | Clear the Speed Limit Mode PIN without the PIN (owner and fleet manager only; firmware 2023.38+). |
+| `tesla_guest_mode_set`              | command, **dangerous** | Turn Guest Mode on or off.                                                                        |
+| `tesla_erase_user_data`             | command, **dangerous** | Erase user data (profiles, settings, linked accounts) from the car.                               |
+| `tesla_homelink_trigger`            | command, **dangerous** | Trigger HomeLink (garage door or gate).                                                           |
+| `tesla_software_update_schedule`    | command, **dangerous** | Schedule installing a downloaded software update after a delay in seconds (0 = now).              |
+| `tesla_software_update_cancel`      | command                | Cancel a scheduled software update that has not started installing.                               |
+| `tesla_vehicle_set_name`            | command                | Rename the car.                                                                                   |
+
+### Vehicle data, sharing, and Fleet Telemetry
+
+| Tool                                          | Kind                   | What it does                                                                                                                                                          |
+| --------------------------------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tesla_vehicle_data`                          | read                   | Live vehicle data from the categories you name (vehicle_data).                                                                                                        |
+| `tesla_vehicle_data_cached`                   | read                   | The last data the car reported, even while it is asleep or offline (never contacts the car).                                                                          |
+| `tesla_vehicle_mobile_enabled`                | read                   | Whether mobile (remote) access is enabled in the car.                                                                                                                 |
+| `tesla_vehicle_nearby_charging_sites`         | read                   | Superchargers and destination chargers near the car's current location, with availability.                                                                            |
+| `tesla_vehicle_recent_alerts`                 | read                   | Recent alerts the car has raised.                                                                                                                                     |
+| `tesla_vehicle_release_notes`                 | read                   | Release notes for the car's installed firmware.                                                                                                                       |
+| `tesla_vehicle_service_data`                  | read                   | The car's service status (for example an open service visit).                                                                                                         |
+| `tesla_vehicle_fleet_status`                  | read                   | Firmware version, whether signed commands are required, Fleet Telemetry version, and the number of keys.                                                              |
+| `tesla_vehicle_options`                       | read                   | The car's option and configuration details.                                                                                                                           |
+| `tesla_vehicle_warranty`                      | read                   | Warranty information for the car.                                                                                                                                     |
+| `tesla_vehicle_eligible_subscriptions`        | read                   | Subscriptions the car is eligible for (for example Premium Connectivity).                                                                                             |
+| `tesla_vehicle_eligible_upgrades`             | read                   | Software upgrades the car is eligible for.                                                                                                                            |
+| `tesla_vehicle_charging_history`              | read                   | Paid charging history (Supercharger sessions, fees) for the car.                                                                                                      |
+| `tesla_vehicle_fleet_telemetry_config`        | read                   | The car's Fleet Telemetry streaming configuration for this app: whether it is synced and whether the config limit is reached.                                         |
+| `tesla_vehicle_fleet_telemetry_errors`        | read                   | Recent Fleet Telemetry errors the car reported for this app's configuration.                                                                                          |
+| `tesla_vehicle_fleet_telemetry_config_delete` | command                | Remove this app's Fleet Telemetry streaming configuration from the car.                                                                                               |
+| `tesla_vehicle_drivers_list`                  | read                   | Drivers who have access to the car through sharing (owner only).                                                                                                      |
+| `tesla_vehicle_driver_remove`                 | command                | Remove a shared driver's access to the car.                                                                                                                           |
+| `tesla_vehicle_share_invites_list`            | read                   | Active invitations to share the car.                                                                                                                                  |
+| `tesla_vehicle_share_invite_create`           | command, **dangerous** | Create a single-use invitation link (valid 24 hours) that gives whoever redeems it driver access to the car in the Tesla app, including location and remote commands. |
+| `tesla_vehicle_share_invite_revoke`           | command                | Revoke a share invitation so its link no longer works.                                                                                                                |
+
+### Navigation and sound
+
+| Tool                                 | Kind    | What it does                                                                                     |
+| ------------------------------------ | ------- | ------------------------------------------------------------------------------------------------ |
+| `tesla_navigation_send_destination`  | command | Send an address or place name to the car's navigation, as sharing it from the Tesla app does.    |
+| `tesla_navigation_send_coordinates`  | command | Start navigation to coordinates.                                                                 |
+| `tesla_navigation_send_supercharger` | command | Start navigation to a Supercharger by id (for example from tesla_vehicle_nearby_charging_sites). |
+| `tesla_navigation_send_waypoints`    | command | Send a multi-stop route to the car's navigation as Google Maps place ids, in order.              |
+| `tesla_play_sound`                   | command | Play a sound on the external speaker (Boombox): locate_ping or fart.                             |
+
+### Energy (Powerwall, solar, Wall Connector)
+
+| Tool                                                 | Kind    | What it does                                                                                                                             |
+| ---------------------------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `tesla_energy_live_status`                           | read    | Live power flows (solar, battery, grid, home), battery percent, grid status, and Storm Watch state.                                      |
+| `tesla_energy_site_info`                             | read    | Site configuration: installed assets, backup reserve, operation mode, tariff, and supported features.                                    |
+| `tesla_energy_site_status`                           | read    | Battery percent and power, site name, and Storm Watch state.                                                                             |
+| `tesla_energy_backup_time_remaining`                 | read    | Estimated hours the battery can power the home in an outage at the current load.                                                         |
+| `tesla_energy_history`                               | read    | Energy produced, consumed, imported, and exported, aggregated by period (Wh).                                                            |
+| `tesla_energy_backup_history`                        | read    | Past grid outages (backup events) and their duration.                                                                                    |
+| `tesla_energy_charge_history`                        | read    | Wall Connector charging sessions and energy (Wh).                                                                                        |
+| `tesla_energy_charger_live_status`                   | read    | Live state and power of the site's Wall Connectors.                                                                                      |
+| `tesla_energy_tariff_rate`                           | read    | The site's utility rate plan: time-of-use periods and buy and sell prices.                                                               |
+| `tesla_energy_set_backup_reserve`                    | command | Set the battery's backup reserve: the percent kept for outages.                                                                          |
+| `tesla_energy_set_operation_mode`                    | command | Set the operation mode: self_consumption (self-powered) or autonomous (time-based control).                                              |
+| `tesla_energy_set_storm_watch`                       | command | Turn Storm Watch on or off (charge fully ahead of severe weather).                                                                       |
+| `tesla_energy_set_grid_import_export`                | command | Allow or disallow charging the battery from the grid, and set what may be exported to the grid: pv_only, battery_ok, or never.           |
+| `tesla_energy_set_off_grid_vehicle_charging_reserve` | command | During an outage, stop charging vehicles from the battery below this percent.                                                            |
+| `tesla_energy_set_time_of_use`                       | command | Replace the site's time-of-use tariff with tariff_content_v2 (Tesla's tariff structure: seasons, energy_charges, sell_tariff, currency). |
+
+### Account
+
+| Tool                           | Kind | What it does                                                                                      |
+| ------------------------------ | ---- | ------------------------------------------------------------------------------------------------- |
+| `tesla_account_products`       | read | Every vehicle and energy product on the account, with energy_site_id values for the energy tools. |
+| `tesla_account_me`             | read | The signed-in account's profile summary.                                                          |
+| `tesla_account_region`         | read | The account's region and its Fleet API base URL.                                                  |
+| `tesla_account_orders`         | read | The account's active vehicle orders.                                                              |
+| `tesla_account_feature_config` | read | Feature flags Tesla sets for the account.                                                         |
 
 ## Safety model
 
 - **Confirmation required.** Every state-changing tool refuses to act unless called with `confirm: true`, and
   accepts `dryRun: true` to describe the action without contacting the car. Refusals are audited.
-- **No dangerous commands.** Unlock, remote start, opening trunks/frunk/windows, valet/PIN/speed-limit changes,
-  HomeLink, and data erase are not implemented. A single gate (`DANGEROUS_COMMANDS_ENABLED`, default `"false"`)
-  must be explicitly enabled before any such tool could even be registered.
-- **Never wakes implicitly.** Status reads report "asleep" instead of waking the car. Only `tesla_wake` and
-  `tesla_lock` wake it.
-- **Explicit command allowlist.** The signer can only build the commands it names (today: door lock). It is not a
-  generic vehicle-command proxy.
+- **Dangerous commands are off by default.** Unlock, remote start, opening the trunk, frunk, tonneau, windows,
+  sunroof, or charge port, turning Sentry Mode off, Valet Mode, PIN to Drive, Speed Limit Mode, Guest Mode, data
+  erase, HomeLink, scheduling a software update, and creating a share invite are only registered when
+  `DANGEROUS_COMMANDS_ENABLED` is exactly `"true"` (default `"false"`). The server checks the same flag again before
+  sending any of them.
+- **Never wakes implicitly.** Reads report "asleep" instead of waking the car, and commands to an asleep car fail
+  with `vehicle_asleep`. Only `tesla_wake` and `tesla_lock` wake it.
+- **Explicit allowlists.** The signer only builds the commands in `SIGNED_COMMANDS`, and REST calls only go to the
+  endpoints in `src/tesla/endpoints.ts`, from fixed path templates. It is not a generic proxy.
 - **Secrets stay secret.** Tesla tokens are stored AES-256-GCM encrypted in a Durable Object. Tokens, keys, and
   raw Tesla responses are never logged or written to the audit log.
 - **Fail closed.** No `MCP_BEARER_TOKEN` means every `/mcp` request is refused. A command key that does not match
@@ -63,6 +241,23 @@ The server runs nothing on its own. To lock the car every night (or on any other
    `wake_timeout`, `still_unlocked`). Do not loop on failures: the tool has already retried.
 
 Every call is in the audit log (`tesla_audit_recent`).
+
+## Scopes
+
+The Worker does not choose scopes: it refreshes the token you signed in with, so tools can only do what that sign-in
+allows. The setup below requests `openid offline_access vehicle_device_data vehicle_cmds`, which covers every
+vehicle tool except `tesla_vehicle_charging_history` and location data. The others need more scopes in your
+developer app and sign-in:
+
+| Scope                   | Tools                                                                                              |
+| ----------------------- | -------------------------------------------------------------------------------------------------- |
+| `vehicle_location`      | `tesla_vehicle_data` with `location_data`                                                          |
+| `vehicle_charging_cmds` | `tesla_vehicle_charging_history`                                                                   |
+| `user_data`             | `tesla_account_me`, `tesla_account_region`, `tesla_account_orders`, `tesla_account_feature_config` |
+| `energy_device_data`    | the `tesla_energy_*` read tools                                                                    |
+| `energy_cmds`           | the `tesla_energy_set_*` tools                                                                     |
+
+Without them those tools fail with `forbidden` and name the missing scope. [GAP.md](GAP.md) has the full mapping.
 
 ## Self-hosting
 
@@ -140,14 +335,20 @@ npm run check       # typecheck, Biome lint, tests
 npm run deploy:dry  # bundle without deploying
 ```
 
-Tests run in the Workers runtime against a simulated Tesla (Fleet API, OAuth, and a vehicle that performs the real
-ECDH handshake and verifies every signature). All test credentials are generated at runtime. The VCSEC vectors in
-`test/vcp-vectors.test.ts` come from `scripts/vcsec_vectors.py`.
+Tests run in the Workers runtime against a simulated Tesla (Fleet API, OAuth, energy sites, and a vehicle that runs
+real VCSEC and infotainment sessions: ECDH handshakes, signature checks, and encrypted replies). All test credentials
+are generated at runtime. The Python cross-check of the VCSEC lock in `test/vcp-vectors.test.ts` comes from
+`scripts/vcsec_vectors.py`.
 
-`bash conformance/run.sh` (needs Go) checks the shared vectors in `test/vectors/vcsec-lock.json` against Tesla's
-official Go implementation at a pinned commit of `teslamotors/vehicle-command`. It covers key derivation, the
-handshake, the signed lock, the response request hash, and AES-GCM response decryption. CI runs it as the
-`go-conformance` job.
+`bash conformance/run.sh` (needs Go and git) checks the shared vectors against Tesla's official Go implementation at
+a pinned commit of `teslamotors/vehicle-command`:
+- `test/vectors/vcsec-lock.json` and `test/vectors/infotainment-honk.json`: key derivation, the handshake, signing,
+  the response request hash, and AES-GCM reply decryption, in both domains, through Tesla's Signer and Verifier.
+- `test/vectors/vcp-commands.json`: the payload of every signed command, byte for byte, as Tesla's own
+  `pkg/vehicle` methods build it.
+
+CI runs it as the `go-conformance` job. Without a local Go, `docker run --rm -v "$PWD":/repo:ro -w /repo
+golang:1.27.3 bash conformance/run.sh` works too.
 
 ## License
 

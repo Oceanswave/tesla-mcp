@@ -1,38 +1,17 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { McpAuthenticator } from "../src/auth";
 import { DANGEROUS_ACTIONS, type DangerousAction, gateTools } from "../src/mcp/dangerous";
 import type { OwnerState } from "../src/owner/state";
-import { handleRequest } from "../src/routes";
-import { FakeTesla, uniqueName } from "./helpers/fake-tesla";
-
-const ENDPOINT = "https://tesla-mcp.example/mcp";
+import { FakeTesla } from "./helpers/fake-tesla";
+import { connect, type ToolResult } from "./helpers/mcp";
+import { DANGEROUS_TOOLS } from "./helpers/tools";
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
-/** Each test acts as its own owner (its own OwnerState), through the real
- * /mcp handler, with the authenticator seam a later OAuth sign-in will use. */
-async function connect(overrides: Partial<typeof env> = {}) {
-  const ownerId = uniqueName("mcp-owner");
-  const authenticator: McpAuthenticator = {
-    authenticate: async () => ({ ok: true, principal: { ownerId } }),
-  };
-  const client = new Client({ name: "tesla-mcp-test", version: "1.0.0" });
-  const transport = new StreamableHTTPClientTransport(new URL(ENDPOINT), {
-    fetch: (url, init) => handleRequest(new Request(url, init), { ...env, ...overrides }, authenticator),
-  });
-  await client.connect(transport);
-  const owner = env.OWNER.get(env.OWNER.idFromName(ownerId));
-  return { client, owner };
-}
-
-type ToolResult = { isError?: boolean; structuredContent?: Record<string, unknown>; content: unknown[] };
-
-const EXPECTED_TOOLS = [
+const CORE_TOOLS = [
   "tesla_audit_recent",
   "tesla_auth_status",
   "tesla_lock",
@@ -48,9 +27,12 @@ describe("MCP over the real /mcp handler", () => {
     const { client } = await connect();
     expect(client.getServerVersion()?.name).toBe("tesla-mcp");
     const { tools } = await client.listTools();
-    expect(tools.map((tool) => tool.name).sort()).toEqual(EXPECTED_TOOLS);
+    const names = tools.map((tool) => tool.name);
+    expect(names).toEqual(expect.arrayContaining(CORE_TOOLS));
+    // A tool changes state exactly when it takes confirm.
     for (const tool of tools) {
-      expect(tool.annotations?.readOnlyHint).toBe(!["tesla_lock", "tesla_wake"].includes(tool.name));
+      const properties = (tool.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+      expect(tool.annotations?.readOnlyHint, tool.name).toBe(!("confirm" in properties));
     }
     for (const name of ["tesla_lock", "tesla_wake"]) {
       const schema = tools.find((tool) => tool.name === name)?.inputSchema as { properties: Record<string, unknown> };
@@ -203,25 +185,23 @@ describe("MCP over the real /mcp handler", () => {
 });
 
 describe("dangerous-command gate", () => {
-  it("registers no dangerous tools by default", async () => {
+  it("registers no dangerous tools by default, and all of them only when enabled", async () => {
     expect(env.DANGEROUS_COMMANDS_ENABLED).toBe("false");
     const { client } = await connect();
-    const names = (await client.listTools()).tools.map((tool) => tool.name).join(" ");
-    for (const pattern of [
-      /unlock/,
-      /remote_start/,
-      /trunk/,
-      /frunk/,
-      /window/,
-      /valet/,
-      /pin/,
-      /speed/,
-      /homelink/,
-      /erase/,
-    ]) {
-      expect(names).not.toMatch(pattern);
-    }
+    const safe = (await client.listTools()).tools.map((tool) => tool.name);
+    for (const name of DANGEROUS_TOOLS) expect(safe).not.toContain(name);
     await client.close();
+
+    for (const value of ["TRUE", "1", "yes", "true "]) {
+      const { client: other } = await connect({ DANGEROUS_COMMANDS_ENABLED: value });
+      expect((await other.listTools()).tools.map((tool) => tool.name).sort()).toEqual(safe.sort());
+      await other.close();
+    }
+
+    const { client: enabled } = await connect({ DANGEROUS_COMMANDS_ENABLED: "true" });
+    const all = (await enabled.listTools()).tools.map((tool) => tool.name);
+    expect(all.filter((name) => !safe.includes(name)).sort()).toEqual(DANGEROUS_TOOLS);
+    await enabled.close();
   });
 
   it("filters any tool tagged with a dangerous action unless explicitly enabled", () => {

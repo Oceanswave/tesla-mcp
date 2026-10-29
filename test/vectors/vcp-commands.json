@@ -1,0 +1,693 @@
+{
+  "description": "Signed-command payloads shared by test/vcp-commands.test.ts and conformance/go/tesla_mcp_commands_test.go. Every payload is the exact bytes Tesla's vehicle-command (pkg/vehicle, pinned in conformance/run.sh) builds for the same call; the TypeScript builders must reproduce them. domain 2 = VCSEC, 3 = infotainment.",
+  "vectors": [
+    {
+      "id": "door_lock",
+      "command": "door_lock",
+      "params": {},
+      "domain": 2,
+      "payload": "1001"
+    },
+    {
+      "id": "door_unlock",
+      "command": "door_unlock",
+      "params": {},
+      "domain": 2,
+      "payload": "1000",
+      "note": "RKEAction is a oneof member, so UNLOCK (0) is written explicitly"
+    },
+    {
+      "id": "remote_start_drive",
+      "command": "remote_start_drive",
+      "params": {},
+      "domain": 2,
+      "payload": "1014"
+    },
+    {
+      "id": "auto_secure_vehicle",
+      "command": "auto_secure_vehicle",
+      "params": {},
+      "domain": 2,
+      "payload": "101d"
+    },
+    {
+      "id": "trunk_open",
+      "command": "trunk_open",
+      "params": {},
+      "domain": 2,
+      "payload": "22022801"
+    },
+    {
+      "id": "trunk_close",
+      "command": "trunk_close",
+      "params": {},
+      "domain": 2,
+      "payload": "22022804"
+    },
+    {
+      "id": "frunk_open",
+      "command": "frunk_open",
+      "params": {},
+      "domain": 2,
+      "payload": "22023001"
+    },
+    {
+      "id": "tonneau_open",
+      "command": "tonneau_open",
+      "params": {},
+      "domain": 2,
+      "payload": "22024003"
+    },
+    {
+      "id": "tonneau_close",
+      "command": "tonneau_close",
+      "params": {},
+      "domain": 2,
+      "payload": "22024004"
+    },
+    {
+      "id": "tonneau_stop",
+      "command": "tonneau_stop",
+      "params": {},
+      "domain": 2,
+      "payload": "22024002"
+    },
+    {
+      "id": "auto_conditioning_start",
+      "command": "auto_conditioning_start",
+      "params": {},
+      "domain": 3,
+      "payload": "120452020801"
+    },
+    {
+      "id": "auto_conditioning_stop",
+      "command": "auto_conditioning_stop",
+      "params": {},
+      "domain": 3,
+      "payload": "12025200"
+    },
+    {
+      "id": "set_temps",
+      "command": "set_temps",
+      "params": {
+        "driver_temp_celsius": 21.5,
+        "passenger_temp_celsius": 20
+      },
+      "domain": 3,
+      "payload": "1210720e2a021a00350000ac413d0000a041"
+    },
+    {
+      "id": "set_preconditioning_max_on_override",
+      "command": "set_preconditioning_max",
+      "params": {
+        "on": true,
+        "manual_override": true
+      },
+      "domain": 3,
+      "payload": "1206620408011001"
+    },
+    {
+      "id": "set_preconditioning_max_off",
+      "command": "set_preconditioning_max",
+      "params": {
+        "on": false
+      },
+      "domain": 3,
+      "payload": "12026200"
+    },
+    {
+      "id": "set_bioweapon_mode_on",
+      "command": "set_bioweapon_mode",
+      "params": {
+        "on": true,
+        "manual_override": false
+      },
+      "domain": 3,
+      "payload": "12059a02020801"
+    },
+    {
+      "id": "set_cabin_overheat_protection_fan_only",
+      "command": "set_cabin_overheat_protection",
+      "params": {
+        "on": true,
+        "fan_only": true
+      },
+      "domain": 3,
+      "payload": "120792030408011001"
+    },
+    {
+      "id": "set_cop_temp_medium",
+      "command": "set_cop_temp",
+      "params": {
+        "level": "medium"
+      },
+      "domain": 3,
+      "payload": "12059204020802"
+    },
+    {
+      "id": "set_climate_keeper_mode_dog",
+      "command": "set_climate_keeper_mode",
+      "params": {
+        "mode": "dog",
+        "manual_override": true
+      },
+      "domain": 3,
+      "payload": "1207e2020408021001"
+    },
+    {
+      "id": "set_climate_keeper_mode_off",
+      "command": "set_climate_keeper_mode",
+      "params": {
+        "mode": "off"
+      },
+      "domain": 3,
+      "payload": "1203e20200"
+    },
+    {
+      "id": "remote_seat_heater_front_left_high",
+      "command": "remote_seat_heater_request",
+      "params": {
+        "seats": [
+          {
+            "seat": "front_left",
+            "level": "high"
+          }
+        ]
+      },
+      "domain": 3,
+      "payload": "1209a202060a042a003a00"
+    },
+    {
+      "id": "remote_seat_heater_third_row_right_off",
+      "command": "remote_seat_heater_request",
+      "params": {
+        "seats": [
+          {
+            "seat": "third_row_right",
+            "level": "off"
+          }
+        ]
+      },
+      "domain": 3,
+      "payload": "1209a202060a0412007a00"
+    },
+    {
+      "id": "remote_seat_cooler_front_right_low",
+      "command": "remote_seat_cooler_request",
+      "params": {
+        "seat": "front_right",
+        "level": "low"
+      },
+      "domain": 3,
+      "payload": "12098a03060a0408021002"
+    },
+    {
+      "id": "remote_auto_seat_climate_front_left_on",
+      "command": "remote_auto_seat_climate_request",
+      "params": {
+        "seat": "front_left",
+        "on": true
+      },
+      "domain": 3,
+      "payload": "12098203060a0408011001"
+    },
+    {
+      "id": "remote_steering_wheel_heater_on",
+      "command": "remote_steering_wheel_heater_request",
+      "params": {
+        "on": true
+      },
+      "domain": 3,
+      "payload": "12046a020801"
+    },
+    {
+      "id": "charge_start",
+      "command": "charge_start",
+      "params": {},
+      "domain": 3,
+      "payload": "120432021200"
+    },
+    {
+      "id": "charge_stop",
+      "command": "charge_stop",
+      "params": {},
+      "domain": 3,
+      "payload": "120432022a00"
+    },
+    {
+      "id": "charge_standard",
+      "command": "charge_standard",
+      "params": {},
+      "domain": 3,
+      "payload": "120432021a00"
+    },
+    {
+      "id": "charge_max_range",
+      "command": "charge_max_range",
+      "params": {},
+      "domain": 3,
+      "payload": "120432022200"
+    },
+    {
+      "id": "set_charge_limit_80",
+      "command": "set_charge_limit",
+      "params": {
+        "percent": 80
+      },
+      "domain": 3,
+      "payload": "12042a020850"
+    },
+    {
+      "id": "set_charging_amps_16",
+      "command": "set_charging_amps",
+      "params": {
+        "charging_amps": 16
+      },
+      "domain": 3,
+      "payload": "1205da02020810"
+    },
+    {
+      "id": "charge_port_door_open",
+      "command": "charge_port_door_open",
+      "params": {},
+      "domain": 3,
+      "payload": "1203f20300"
+    },
+    {
+      "id": "charge_port_door_close",
+      "command": "charge_port_door_close",
+      "params": {},
+      "domain": 3,
+      "payload": "1203ea0300"
+    },
+    {
+      "id": "set_scheduled_charging_on",
+      "command": "set_scheduled_charging",
+      "params": {
+        "enabled": true,
+        "time_minutes": 120
+      },
+      "domain": 3,
+      "payload": "1207ca020408011078"
+    },
+    {
+      "id": "set_scheduled_departure",
+      "command": "set_scheduled_departure",
+      "params": {
+        "departure_minutes": 450,
+        "off_peak_end_minutes": 360,
+        "preconditioning": "weekdays",
+        "off_peak_charging": "all_week"
+      },
+      "domain": 3,
+      "payload": "1213d20210080110c2031a02120022020a0028e802"
+    },
+    {
+      "id": "clear_scheduled_departure",
+      "command": "clear_scheduled_departure",
+      "params": {},
+      "domain": 3,
+      "payload": "1203d20200"
+    },
+    {
+      "id": "add_charge_schedule",
+      "command": "add_charge_schedule",
+      "params": {
+        "id": 1700000000,
+        "name": "Home",
+        "days_of_week": ["monday", "wednesday", "friday"],
+        "start_enabled": true,
+        "start_time_minutes": 1320,
+        "end_enabled": true,
+        "end_time_minutes": 360,
+        "one_time": false,
+        "enabled": true,
+        "latitude": 37.5,
+        "longitude": -122.25
+      },
+      "domain": 3,
+      "payload": "12278a06240880e2cfaa061204486f6d65182a200128a80a300138e802480155000016425d0080f4c2"
+    },
+    {
+      "id": "remove_charge_schedule",
+      "command": "remove_charge_schedule",
+      "params": {
+        "id": 1700000000
+      },
+      "domain": 3,
+      "payload": "12099206060880e2cfaa06"
+    },
+    {
+      "id": "batch_remove_charge_schedules_home_other",
+      "command": "batch_remove_charge_schedules",
+      "params": {
+        "home": true,
+        "other": true
+      },
+      "domain": 3,
+      "payload": "1207e2060408011801"
+    },
+    {
+      "id": "add_precondition_schedule",
+      "command": "add_precondition_schedule",
+      "params": {
+        "id": 1700000001,
+        "days_of_week": ["sunday", "saturday"],
+        "precondition_time_minutes": 480,
+        "one_time": true,
+        "enabled": true,
+        "latitude": -33.875,
+        "longitude": 151.25
+      },
+      "domain": 3,
+      "payload": "121c9a06190881e2cfaa06184120e003280130013d008007c24500401743"
+    },
+    {
+      "id": "remove_precondition_schedule",
+      "command": "remove_precondition_schedule",
+      "params": {
+        "id": 1700000001
+      },
+      "domain": 3,
+      "payload": "1209a206060881e2cfaa06"
+    },
+    {
+      "id": "batch_remove_precondition_schedules_work",
+      "command": "batch_remove_precondition_schedules",
+      "params": {
+        "work": true
+      },
+      "domain": 3,
+      "payload": "1205da06021001"
+    },
+    {
+      "id": "set_low_power_mode_on",
+      "command": "set_low_power_mode",
+      "params": {
+        "enabled": true
+      },
+      "domain": 3,
+      "payload": "12059208020801"
+    },
+    {
+      "id": "keep_accessory_power_mode_on",
+      "command": "keep_accessory_power_mode",
+      "params": {
+        "enabled": true
+      },
+      "domain": 3,
+      "payload": "1205d208020801"
+    },
+    {
+      "id": "adjust_volume_5_5",
+      "command": "adjust_volume",
+      "params": {
+        "volume": 5.5
+      },
+      "domain": 3,
+      "payload": "12088201051d0000b040"
+    },
+    {
+      "id": "adjust_volume_0",
+      "command": "adjust_volume",
+      "params": {
+        "volume": 0
+      },
+      "domain": 3,
+      "payload": "12088201051d00000000",
+      "note": "volume_absolute_float is a oneof member, so 0 is written"
+    },
+    {
+      "id": "media_volume_up",
+      "command": "media_volume_up",
+      "params": {},
+      "domain": 3,
+      "payload": "12058201020802"
+    },
+    {
+      "id": "media_volume_down",
+      "command": "media_volume_down",
+      "params": {},
+      "domain": 3,
+      "payload": "12058201020801",
+      "note": "volume_delta is sint32: -1 ZigZag-encodes to 1"
+    },
+    {
+      "id": "media_toggle_playback",
+      "command": "media_toggle_playback",
+      "params": {},
+      "domain": 3,
+      "payload": "12027a00"
+    },
+    {
+      "id": "media_next_fav",
+      "command": "media_next_fav",
+      "params": {},
+      "domain": 3,
+      "payload": "12038a0100"
+    },
+    {
+      "id": "media_prev_fav",
+      "command": "media_prev_fav",
+      "params": {},
+      "domain": 3,
+      "payload": "1203920100"
+    },
+    {
+      "id": "media_next_track",
+      "command": "media_next_track",
+      "params": {},
+      "domain": 3,
+      "payload": "12039a0100"
+    },
+    {
+      "id": "media_prev_track",
+      "command": "media_prev_track",
+      "params": {},
+      "domain": 3,
+      "payload": "1203a20100"
+    },
+    {
+      "id": "honk_horn",
+      "command": "honk_horn",
+      "params": {},
+      "domain": 3,
+      "payload": "1203da0100"
+    },
+    {
+      "id": "flash_lights",
+      "command": "flash_lights",
+      "params": {},
+      "domain": 3,
+      "payload": "1203d20100"
+    },
+    {
+      "id": "window_vent",
+      "command": "window_vent",
+      "params": {},
+      "domain": 3,
+      "payload": "12059202021a00"
+    },
+    {
+      "id": "window_close",
+      "command": "window_close",
+      "params": {},
+      "domain": 3,
+      "payload": "12059202022200"
+    },
+    {
+      "id": "sunroof_vent",
+      "command": "sunroof_vent",
+      "params": {},
+      "domain": 3,
+      "payload": "12058202021a00",
+      "note": "Tesla's Go client has no sunroof vent method; checked against its carserver schema"
+    },
+    {
+      "id": "sunroof_close",
+      "command": "sunroof_close",
+      "params": {},
+      "domain": 3,
+      "payload": "12058202022200",
+      "note": "Tesla's Go client has no sunroof close method; checked against its carserver schema"
+    },
+    {
+      "id": "set_sentry_mode_on",
+      "command": "set_sentry_mode",
+      "params": {
+        "on": true
+      },
+      "domain": 3,
+      "payload": "1205f201020801"
+    },
+    {
+      "id": "set_sentry_mode_off",
+      "command": "set_sentry_mode",
+      "params": {
+        "on": false
+      },
+      "domain": 3,
+      "payload": "1203f20100"
+    },
+    {
+      "id": "set_valet_mode_on",
+      "command": "set_valet_mode",
+      "params": {
+        "on": true,
+        "pin": "1234"
+      },
+      "domain": 3,
+      "payload": "120bfa01080801120431323334"
+    },
+    {
+      "id": "set_valet_mode_off",
+      "command": "set_valet_mode",
+      "params": {
+        "on": false
+      },
+      "domain": 3,
+      "payload": "1203fa0100"
+    },
+    {
+      "id": "reset_valet_pin",
+      "command": "reset_valet_pin",
+      "params": {},
+      "domain": 3,
+      "payload": "1203e20100"
+    },
+    {
+      "id": "set_pin_to_drive_on",
+      "command": "set_pin_to_drive",
+      "params": {
+        "on": true,
+        "pin": "4321"
+      },
+      "domain": 3,
+      "payload": "120bea04080801120434333231"
+    },
+    {
+      "id": "reset_pin_to_drive_pin",
+      "command": "reset_pin_to_drive_pin",
+      "params": {},
+      "domain": 3,
+      "payload": "1203f20400"
+    },
+    {
+      "id": "clear_pin_to_drive_admin",
+      "command": "clear_pin_to_drive_admin",
+      "params": {},
+      "domain": 3,
+      "payload": "1203ca0500"
+    },
+    {
+      "id": "speed_limit_activate",
+      "command": "speed_limit_activate",
+      "params": {
+        "pin": "1111"
+      },
+      "domain": 3,
+      "payload": "120a4a080801120431313131"
+    },
+    {
+      "id": "speed_limit_deactivate",
+      "command": "speed_limit_deactivate",
+      "params": {
+        "pin": "1111"
+      },
+      "domain": 3,
+      "payload": "12084a06120431313131"
+    },
+    {
+      "id": "speed_limit_set_limit_65",
+      "command": "speed_limit_set_limit",
+      "params": {
+        "limit_mph": 65
+      },
+      "domain": 3,
+      "payload": "120b4209090000000000405040"
+    },
+    {
+      "id": "speed_limit_clear_pin",
+      "command": "speed_limit_clear_pin",
+      "params": {
+        "pin": "1111"
+      },
+      "domain": 3,
+      "payload": "12083a060a0431313131"
+    },
+    {
+      "id": "speed_limit_clear_pin_admin",
+      "command": "speed_limit_clear_pin_admin",
+      "params": {},
+      "domain": 3,
+      "payload": "1203fa0400"
+    },
+    {
+      "id": "guest_mode_on",
+      "command": "guest_mode",
+      "params": {
+        "enabled": true
+      },
+      "domain": 3,
+      "payload": "12058a04020801"
+    },
+    {
+      "id": "guest_mode_off",
+      "command": "guest_mode",
+      "params": {
+        "enabled": false
+      },
+      "domain": 3,
+      "payload": "12038a0400"
+    },
+    {
+      "id": "erase_user_data",
+      "command": "erase_user_data",
+      "params": {},
+      "domain": 3,
+      "payload": "1203c20400"
+    },
+    {
+      "id": "trigger_homelink",
+      "command": "trigger_homelink",
+      "params": {
+        "latitude": 37.5,
+        "longitude": -122.25
+      },
+      "domain": 3,
+      "payload": "120f8a020c0a0a0d00001642150080f4c2"
+    },
+    {
+      "id": "schedule_software_update_2h",
+      "command": "schedule_software_update",
+      "params": {
+        "offset_seconds": 7200
+      },
+      "domain": 3,
+      "payload": "1206ea010308a038"
+    },
+    {
+      "id": "cancel_software_update",
+      "command": "cancel_software_update",
+      "params": {},
+      "domain": 3,
+      "payload": "1203ca0100"
+    },
+    {
+      "id": "set_vehicle_name",
+      "command": "set_vehicle_name",
+      "params": {
+        "name": "Road Runner"
+      },
+      "domain": 3,
+      "payload": "1210b2030d0a0b526f61642052756e6e6572"
+    },
+    {
+      "id": "ping",
+      "command": "ping",
+      "params": {},
+      "domain": 3,
+      "payload": "1205f202020801"
+    }
+  ]
+}

@@ -32,6 +32,7 @@ import {
   SIGNED_COMMANDS,
 } from "../src/tesla/vcp/protocol";
 import { TeslaVcpCore, VcpError } from "../src/tesla/vcp/session";
+import HONK from "./vectors/infotainment-honk.json";
 import TESLA from "./vectors/vcsec-lock.json";
 
 const PY = {
@@ -341,3 +342,130 @@ describe("VCSEC vectors match Tesla's vehicle-command (Go)", () => {
     expect(error).toMatchObject({ code: "status_unknown", stage: "command_response_authentication" });
   });
 });
+
+// Infotainment (CarServer) vectors, produced by Tesla's Go code the same way:
+// the request hash keeps the full HMAC tag and the reply is AES-GCM encrypted.
+describe("infotainment vectors match Tesla's vehicle-command (Go)", () => {
+  const [honk] = HONK.commands;
+  if (!honk) throw new Error("missing honk vector");
+  const reply = HONK.encrypted_response;
+
+  it("shares keys and session info with the VCSEC vectors", () => {
+    expect(HONK.inputs).toEqual({ ...TESLA.inputs, domain: DOMAIN_INFOTAINMENT });
+    expect(HONK.derived).toEqual(TESLA.derived);
+    expect(HONK.handshake.session_info).toBe(TESLA.handshake.session_info);
+    expect(bytesToHex(SIGNED_COMMANDS.honk_horn.payload({}))).toBe(HONK.honk_payload);
+    expect([SIGNED_COMMANDS.honk_horn.domain, SIGNED_COMMANDS.honk_horn.flags]).toEqual([
+      DOMAIN_INFOTAINMENT,
+      honk.flags,
+    ]);
+  });
+
+  it("builds Tesla's infotainment handshake and signed honk", async () => {
+    expect(
+      bytesToHex(
+        buildSessionInfoRequest(
+          bytesFromHex(HONK.derived.client_public_point),
+          ROUTING,
+          UUID_HANDSHAKE,
+          DOMAIN_INFOTAINMENT,
+        ),
+      ),
+    ).toBe(HONK.handshake.request);
+    const payload = bytesFromHex(HONK.honk_payload);
+    const metadata = encodeCommandMetadata({
+      vin: VIN,
+      epoch: EPOCH,
+      expiresAt: honk.expires_at,
+      counter: honk.counter,
+      domain: DOMAIN_INFOTAINMENT,
+      flags: honk.flags,
+    });
+    expect(bytesToHex(metadata)).toBe(honk.metadata);
+    const tag = await hmacSha256(bytesFromHex(HONK.derived.hmac_command), metadata, new Uint8Array([0xff]), payload);
+    expect(bytesToHex(tag)).toBe(honk.tag);
+    const message = buildSignedCommand({
+      publicKey: bytesFromHex(HONK.derived.client_public_point),
+      routingAddress: ROUTING,
+      uuid: bytesFromHex(honk.command_uuid),
+      payload,
+      epoch: EPOCH,
+      counter: honk.counter,
+      expiresAt: honk.expires_at,
+      tag,
+      domain: DOMAIN_INFOTAINMENT,
+      flags: honk.flags,
+    });
+    expect(bytesToHex(message)).toBe(honk.routable_message);
+    expect(bytesToHex(responseRequestHash(DOMAIN_INFOTAINMENT, tag))).toBe(honk.request_hash);
+    expect(
+      bytesToHex(
+        encodeResponseMetadata({
+          vin: VIN,
+          domain: DOMAIN_INFOTAINMENT,
+          counter: reply.counter,
+          flags: reply.flags,
+          requestHash: bytesFromHex(honk.request_hash),
+          fault: reply.fault,
+        }),
+      ),
+    ).toBe(reply.metadata);
+  });
+
+  it("accepts Tesla's encrypted CarServer reply end to end, and nothing weaker", async () => {
+    const sent: string[] = [];
+    await honkThroughCore(bytesFromHex(reply.routable_message), sent);
+    expect(sent).toEqual([HONK.handshake.request, honk.routable_message]);
+
+    const flipped = (Number.parseInt(reply.tag.slice(0, 2), 16) ^ 1).toString(16).padStart(2, "0");
+    const tampered = bytesFromHex(reply.routable_message.replace(reply.tag, `${flipped}${reply.tag.slice(2)}`));
+    await expect(honkThroughCore(tampered)).rejects.toMatchObject({
+      code: "status_unknown",
+      stage: "command_response_authentication",
+    });
+
+    // A plaintext "success" to a request that asked for encryption.
+    const plaintext = concatBytes(
+      encodeLengthDelimited(7, new Uint8Array([0x08, DOMAIN_INFOTAINMENT])),
+      encodeLengthDelimited(10, bytesFromHex(reply.plaintext)),
+      encodeLengthDelimited(50, UUID_COMMAND),
+    );
+    await expect(honkThroughCore(plaintext)).rejects.toMatchObject({
+      code: "status_unknown",
+      stage: "response_not_encrypted",
+    });
+  });
+});
+
+/** honk_horn through TeslaVcpCore, answering the infotainment handshake with
+ * the vector session info and the command with `commandReply`. */
+async function honkThroughCore(commandReply: Uint8Array, sent: string[] = []): Promise<string[]> {
+  const randoms = [ROUTING, UUID_HANDSHAKE, UUID_COMMAND];
+  const core = new TeslaVcpCore({
+    fleetBaseUrl: "https://fleet-api.tesla.test",
+    privateKeyPkcs8Base64: CLIENT.pkcs8Base64,
+    publicKeyPem: CLIENT.publicKeyPem,
+    now: () => 1_900_000_000_000,
+    randomBytes16: () => randoms.shift() as Uint8Array,
+    sleep: async () => {},
+    fetchFn: async (_input, init) => {
+      const message = JSON.parse(String(init?.body)).routable_message as string;
+      sent.push(bytesToHex(Uint8Array.from(atob(message), (c) => c.charCodeAt(0))));
+      const response =
+        sent.length === 1
+          ? concatBytes(
+              encodeLengthDelimited(7, new Uint8Array([0x08, DOMAIN_INFOTAINMENT])),
+              encodeLengthDelimited(
+                13,
+                encodeLengthDelimited(6, encodeLengthDelimited(1, bytesFromHex(HONK.handshake.session_info_tag))),
+              ),
+              encodeLengthDelimited(15, bytesFromHex(HONK.handshake.session_info)),
+              encodeLengthDelimited(50, UUID_HANDSHAKE),
+            )
+          : commandReply;
+      return Response.json({ response: bytesToBase64(response) });
+    },
+  });
+  await core.command({ vin: VIN, accessToken: "test-access-token-0123456789", command: "honk_horn" });
+  return sent;
+}

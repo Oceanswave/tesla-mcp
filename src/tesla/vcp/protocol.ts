@@ -1,11 +1,32 @@
 // Tesla Vehicle Command Protocol primitives.
 //
-// A tiny, hand-written protobuf codec for the UniversalMessage envelope and an
+// The UniversalMessage envelope (on the wire codec in ./proto) and an
 // explicit command allowlist. Accepting arbitrary protobuf or command input
 // would turn the Worker into a generic vehicle-command proxy, so payloads are
 // only ever built from the named commands in this file.
 
 import { concatBytes } from "../../bytes";
+import { type CommandParams, carServerPayloads, vcsecPayloads } from "./payloads";
+import {
+  bytesField,
+  encodeFixed32Field,
+  encodeLengthDelimited,
+  encodeVarintField,
+  numberField,
+  type ProtoField,
+  parseFields,
+} from "./proto";
+
+export {
+  bytesField,
+  encodeFixed32Field,
+  encodeLengthDelimited,
+  encodeVarint,
+  encodeVarintField,
+  numberField,
+  type ProtoField,
+  parseFields,
+} from "./proto";
 
 export const DOMAIN_VEHICLE_SECURITY = 2; // VCSEC: lock, unlock, closures, keys
 export const DOMAIN_INFOTAINMENT = 3; // CarServer: climate, charging, media
@@ -50,108 +71,8 @@ export const MESSAGE_FAULT = {
 
 export const OPERATION_STATUS = { OK: 0, WAIT: 1, ERROR: 2 } as const;
 
-type ProtoValue = number | Uint8Array;
-export type ProtoField = { number: number; wireType: number; value: ProtoValue };
-
 const EMPTY = new Uint8Array();
 const encoder = new TextEncoder();
-
-export function encodeVarint(value: number): Uint8Array {
-  if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
-    throw new Error("uint32 out of range");
-  }
-  const bytes: number[] = [];
-  let remaining = value;
-  do {
-    let byte = remaining % 128;
-    remaining = Math.floor(remaining / 128);
-    if (remaining) byte |= 0x80;
-    bytes.push(byte);
-  } while (remaining);
-  return new Uint8Array(bytes);
-}
-
-function encodeTag(fieldNumber: number, wireType: number): Uint8Array {
-  return encodeVarint(fieldNumber * 8 + wireType);
-}
-
-export function encodeLengthDelimited(fieldNumber: number, value: Uint8Array): Uint8Array {
-  return concatBytes(encodeTag(fieldNumber, 2), encodeVarint(value.byteLength), value);
-}
-
-export function encodeVarintField(fieldNumber: number, value: number): Uint8Array {
-  return concatBytes(encodeTag(fieldNumber, 0), encodeVarint(value));
-}
-
-export function encodeFixed32Field(fieldNumber: number, value: number): Uint8Array {
-  if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
-    throw new Error("uint32 out of range");
-  }
-  const bytes = new Uint8Array(4);
-  new DataView(bytes.buffer).setUint32(0, value, true);
-  return concatBytes(encodeTag(fieldNumber, 5), bytes);
-}
-
-function decodeVarint(data: Uint8Array, start: number): [number, number] {
-  let result = 0;
-  let multiplier = 1;
-  let offset = start;
-  // Ten bytes is the protobuf maximum; values beyond uint32 are rejected by
-  // callers, but a valid encoder may still sign-extend negative enum values.
-  for (let count = 0; count < 10 && offset < data.byteLength; count++) {
-    const byte = data[offset++] as number;
-    result += (byte & 0x7f) * multiplier;
-    if (!(byte & 0x80)) return [result, offset];
-    multiplier *= 128;
-  }
-  throw new Error("malformed protobuf varint");
-}
-
-export function parseFields(data: Uint8Array): ProtoField[] {
-  const fields: ProtoField[] = [];
-  let offset = 0;
-  while (offset < data.byteLength) {
-    const [tag, afterTag] = decodeVarint(data, offset);
-    offset = afterTag;
-    const number = Math.floor(tag / 8);
-    const wireType = tag & 7;
-    if (!number) throw new Error("malformed protobuf field");
-
-    if (wireType === 0) {
-      const [value, afterValue] = decodeVarint(data, offset);
-      fields.push({ number, wireType, value });
-      offset = afterValue;
-    } else if (wireType === 1) {
-      if (offset + 8 > data.byteLength) throw new Error("truncated protobuf fixed64");
-      fields.push({ number, wireType, value: data.slice(offset, offset + 8) });
-      offset += 8;
-    } else if (wireType === 2) {
-      const [length, afterLength] = decodeVarint(data, offset);
-      offset = afterLength;
-      if (length > data.byteLength - offset) throw new Error("truncated protobuf bytes");
-      fields.push({ number, wireType, value: data.slice(offset, offset + length) });
-      offset += length;
-    } else if (wireType === 5) {
-      if (offset + 4 > data.byteLength) throw new Error("truncated protobuf fixed32");
-      const value = new DataView(data.buffer, data.byteOffset + offset, 4).getUint32(0, true);
-      fields.push({ number, wireType, value });
-      offset += 4;
-    } else {
-      throw new Error("unsupported protobuf wire type");
-    }
-  }
-  return fields;
-}
-
-export function bytesField(fields: ProtoField[], number: number): Uint8Array | null {
-  const field = fields.find((candidate) => candidate.number === number && candidate.value instanceof Uint8Array);
-  return field?.value instanceof Uint8Array ? field.value : null;
-}
-
-export function numberField(fields: ProtoField[], number: number): number | null {
-  const field = fields.find((candidate) => candidate.number === number && typeof candidate.value === "number");
-  return typeof field?.value === "number" ? field.value : null;
-}
 
 export type RoutableResponse = {
   operationStatus: number;
@@ -419,33 +340,82 @@ export function validVIN(value: unknown): value is string {
 // VCSEC (DOMAIN_VEHICLE_SECURITY)
 // ---------------------------------------------------------------------------
 
-// vcsec.proto UnsignedMessage field 2: RKEAction_E. Values match the
-// hermes-tescmd-plugin Python implementation (protocol/payloads.py).
-export const RKE_ACTION = { UNLOCK: 0, LOCK: 1 } as const;
-
-/** VCSEC UnsignedMessage { RKEAction_E RKEAction = 2 }. Proto3 omits a zero
- * enum, so the (dangerous, not implemented) unlock would be an empty message;
- * only lock is exposed here. */
+/** VCSEC UnsignedMessage { RKEAction_E RKEAction = 2 } = LOCK. */
 export function buildVcsecLockPayload(): Uint8Array {
-  return encodeVarintField(2, RKE_ACTION.LOCK);
+  return vcsecPayloads.door_lock();
 }
 
-/** Signed commands this Worker can build. Adding a command means adding an
- * entry here with its domain and payload builder, plus test vectors. */
+// Matches the Python plugin: VCSEC commands are sent without
+// FLAG_ENCRYPT_RESPONSE and answer with a plaintext FromVCSECMessage.
+const vcsec = (payload: (params: CommandParams) => Uint8Array) =>
+  ({ domain: DOMAIN_VEHICLE_SECURITY, flags: 0, payload }) as const;
+// Infotainment commands ask for an AES-GCM encrypted reply, as Tesla's Go
+// client does by default (vehicle.DefaultFlags), and the core refuses any
+// reply that is not encrypted.
+const infotainment = (payload: (params: CommandParams) => Uint8Array) =>
+  ({ domain: DOMAIN_INFOTAINMENT, flags: FLAG_ENCRYPT_RESPONSE, payload }) as const;
+
+function mapValues<T extends Record<string, (params: CommandParams) => Uint8Array>, R>(
+  table: T,
+  wrap: (payload: (params: CommandParams) => Uint8Array) => R,
+): { [K in keyof T]: R } {
+  return Object.fromEntries(Object.entries(table).map(([name, payload]) => [name, wrap(payload)])) as {
+    [K in keyof T]: R;
+  };
+}
+
+/** Signed commands this Worker can build: the payload builders in
+ * ./payloads.ts, each bound to its domain and flags. Adding a command means
+ * adding a builder there, a vector in test/vectors/vcp-commands.json, and the
+ * matching Tesla call in conformance/go/tesla_mcp_commands_test.go. */
 export const SIGNED_COMMANDS = {
-  door_lock: {
-    domain: DOMAIN_VEHICLE_SECURITY,
-    // Matches the Python plugin: VCSEC commands are sent without
-    // FLAG_ENCRYPT_RESPONSE and answer with a plaintext FromVCSECMessage.
-    flags: 0,
-    payload: buildVcsecLockPayload,
-  },
-} as const satisfies Record<string, { domain: VcpDomain; flags: number; payload: () => Uint8Array }>;
+  ...mapValues(vcsecPayloads, vcsec),
+  ...mapValues(carServerPayloads, infotainment),
+} satisfies Record<string, { domain: VcpDomain; flags: number; payload: (params: CommandParams) => Uint8Array }>;
 
 export type SignedCommandName = keyof typeof SIGNED_COMMANDS;
 
 export function isSignedCommandName(value: unknown): value is SignedCommandName {
   return typeof value === "string" && Object.hasOwn(SIGNED_COMMANDS, value);
+}
+
+export type CarServerResult = { status: "ok" } | { status: "error"; reason: string } | { status: "unknown" };
+
+/** A car's plain-text failure reason ("is_charging", "already_set", ...), kept
+ * only when it is short and printable. */
+function sanitizeReason(value: Uint8Array | null): string {
+  if (!value?.byteLength) return "unspecified";
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(value).trim();
+    return /^[A-Za-z0-9 _.,:'()/-]{1,80}$/.test(text) ? text : "unspecified";
+  } catch {
+    return "unspecified";
+  }
+}
+
+/** Interpret a decrypted CarServer.Response, as Tesla's getCarServerResponse
+ * does (pkg/vehicle/infotainment.go):
+ *
+ *   Response { ActionStatus actionStatus = 1; oneof response_msg { ... } }
+ *   ActionStatus { OperationStatus_E result = 1; ResultReason result_reason = 2; }
+ *   ResultReason { oneof reason { string plain_text = 1; } }
+ *   OperationStatus_E { OPERATIONSTATUS_OK = 0; OPERATIONSTATUS_ERROR = 1; }
+ *
+ * Only an explicit ERROR is a failure; a missing ActionStatus is OK, as in
+ * Tesla's client. Anything that does not decode is "unknown". */
+export function parseCarServerResult(payload: Uint8Array): CarServerResult {
+  try {
+    const status = bytesField(parseFields(payload), 1);
+    if (!status) return { status: "ok" };
+    const fields = parseFields(status);
+    const result = numberField(fields, 1) ?? 0;
+    if (result === 0) return { status: "ok" };
+    if (result !== 1) return { status: "unknown" };
+    const reason = bytesField(fields, 2);
+    return { status: "error", reason: sanitizeReason(reason ? bytesField(parseFields(reason), 1) : null) };
+  } catch {
+    return { status: "unknown" };
+  }
 }
 
 export type VcsecResult =
