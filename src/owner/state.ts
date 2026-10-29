@@ -948,12 +948,17 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   /** Finish a browser sign-in. The state is consumed first, whatever happens
-   * next. The code is exchanged with the redirect URI stored with the state,
-   * and the new tokens replace the stored ones through the token flight, as a
+   * next. The code is exchanged with `redirectUri`, which must still be the
+   * one /login stored with the state (Tesla rejects any other), and the new tokens replace the stored ones through the token flight, as a
    * refresh does. /login is public, so once any token has named the account
    * (its `sub`), only that Tesla account can sign in. A bootstrap value not
    * tried yet is tried first: it is the owner's, and may name the account. */
-  async completeSignIn(input: { state: string; code: string | null; error: string | null }): Promise<SignInResult> {
+  async completeSignIn(input: {
+    state: string;
+    code: string | null;
+    error: string | null;
+    redirectUri: string;
+  }): Promise<SignInResult> {
     const pending = SIGN_IN_STATE_PATTERN.test(input.state)
       ? this.ctx.storage.sql
           .exec<{ redirect_uri: string; expires_at: number }>(
@@ -963,7 +968,9 @@ export class OwnerState extends DurableObject<Env> {
           .toArray()[0]
       : undefined;
     // Not audited: anyone can reach /callback, and the audit log is capped.
-    if (!pending || pending.expires_at <= this.clock()) return { ok: false, reason: "invalid_state" };
+    if (!pending || pending.expires_at <= this.clock() || pending.redirect_uri !== input.redirectUri) {
+      return { ok: false, reason: "invalid_state" };
+    }
     if (input.error || !input.code) return { ok: false, reason: "denied" };
     try {
       await this.tokenKey();
@@ -975,7 +982,7 @@ export class OwnerState extends DurableObject<Env> {
       const { status, body } = await this.tokenRequest("browser_sign_in", {
         grant_type: "authorization_code",
         code: input.code,
-        redirect_uri: pending.redirect_uri,
+        redirect_uri: input.redirectUri,
       });
       const issued = status === 200 ? issuedTokens(body) : null;
       if (!issued?.refreshToken) {

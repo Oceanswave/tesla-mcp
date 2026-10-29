@@ -70,16 +70,22 @@ const SIGN_IN_FAILURES: Record<Exclude<SignInResult, { ok: true }>["reason"], [s
   account_mismatch: ["That is a different Tesla account from the one this server uses. Nothing was changed.", 403],
 };
 
-async function handleLogin(url: URL, env: Env, ownerId: string): Promise<Response> {
+const REDIRECT_NOT_CONFIGURED =
+  "Tesla sign-in is not configured on this server: OAUTH_REDIRECT_BASE must be an https URL.";
+
+async function handleLogin(env: Env, ownerId: string): Promise<Response> {
+  const redirectUri = signInRedirectUri(env.OAUTH_REDIRECT_BASE);
+  if (!redirectUri) return signInPage(REDIRECT_NOT_CONFIGURED, 503);
   const clientId = env.TESLA_CLIENT_ID?.trim();
-  const redirectUri = signInRedirectUri(env.TESLA_REDIRECT_URI, url);
-  if (!clientId || !redirectUri) return signInPage(SIGN_IN_FAILURES.not_configured[0], 503);
+  if (!clientId) return signInPage(SIGN_IN_FAILURES.not_configured[0], 503);
   const owner = env.OWNER.get(env.OWNER.idFromName(ownerId));
   const state = await owner.beginSignIn(redirectUri);
   return new Response(null, { status: 302, headers: { Location: authorizeUrl({ clientId, redirectUri, state }) } });
 }
 
 async function handleCallback(url: URL, env: Env, ownerId: string): Promise<Response> {
+  const redirectUri = signInRedirectUri(env.OAUTH_REDIRECT_BASE);
+  if (!redirectUri) return signInPage(REDIRECT_NOT_CONFIGURED, 503);
   const param = (name: string) => {
     const value = url.searchParams.get(name);
     return value && /^[\x21-\x7e]{1,2048}$/.test(value) ? value : null;
@@ -89,6 +95,7 @@ async function handleCallback(url: URL, env: Env, ownerId: string): Promise<Resp
     state: param("state") ?? "",
     code: param("code"),
     error: url.searchParams.has("error") ? "error" : null,
+    redirectUri,
   });
   if (result.ok) return signInPage(`Tesla sign-in updated, scopes: ${result.scope || "none reported"}`, 200);
   const [message, status] = SIGN_IN_FAILURES[result.reason];
@@ -167,7 +174,7 @@ export async function handleRequest(
     return secure(text(env.TESLA_PUBLIC_KEY_PEM, 200, "application/x-pem-file"), "public, max-age=3600");
   }
   // GET only: a HEAD (a link check, a prefetch) must not create or consume a sign-in.
-  if (request.method === "GET" && url.pathname === "/login") return secure(await handleLogin(url, env, signInOwnerId));
+  if (request.method === "GET" && url.pathname === "/login") return secure(await handleLogin(env, signInOwnerId));
   if (request.method === "GET" && url.pathname === "/callback") {
     return secure(await handleCallback(url, env, signInOwnerId));
   }

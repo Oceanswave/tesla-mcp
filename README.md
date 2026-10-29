@@ -268,8 +268,8 @@ Without them those tools fail with `forbidden` and name the missing scope. A ref
 You need a Tesla developer account, a Cloudflare account, and a domain you control (Tesla fetches your public key
 from it). Node 22 or newer.
 1. **Create a Tesla developer application** at [developer.tesla.com](https://developer.tesla.com). Set the allowed
-   origin to `https://<your-domain>` and the redirect URI to `https://<your-domain>/callback` (add the redirect URI
-   of every host you will open `/login` on). Tick the scopes listed under [Scopes](#scopes): vehicle information,
+   origin to `https://<your-domain>` and the redirect URI to `https://<your-domain>/callback`, the same value
+   `OAUTH_REDIRECT_BASE` will produce (step 3). Tesla's portal rejects domains that contain "tesla". Tick the scopes listed under [Scopes](#scopes): vehicle information,
    vehicle location, vehicle commands, vehicle charging management, profile information, energy product
    information, and energy product commands.
 
@@ -284,7 +284,8 @@ from it). Node 22 or newer.
 3. **Publish the public key.** Put the contents of `public-key.pem` in `TESLA_PUBLIC_KEY_PEM` in `wrangler.jsonc`
    (newlines as `\n`). After deploying, it is served at
    `https://<your-domain>/.well-known/appspecific/com.tesla.3p.public-key.pem`. If your account is outside North
-   America, change `TESLA_FLEET_BASE_URL` to your region's Fleet API host.
+   America, change `TESLA_FLEET_BASE_URL` to your region's Fleet API host. Set `OAUTH_REDIRECT_BASE` to
+   `https://<your-domain>`: browser sign-in sends Tesla `${OAUTH_REDIRECT_BASE}/callback`.
 
 4. **Set secrets** (see `.dev.vars.example` for what each one is):
 
@@ -295,7 +296,6 @@ from it). Node 22 or newer.
    openssl pkcs8 -topk8 -nocrypt -in private-key.pem -outform DER | base64 | tr -d '\n' \
      | npx wrangler secret put TESLA_COMMAND_PRIVATE_KEY_PKCS8_B64
    openssl rand -base64 32 | npx wrangler secret put TOKEN_ENCRYPTION_KEY
-   npx wrangler secret put TESLA_REDIRECT_URI              # optional, see step 7
    npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN   # optional, see step 7
    npx wrangler secret put TESLA_VEHICLE_ID                # optional
    ```
@@ -319,8 +319,9 @@ from it). Node 22 or newer.
 7. **Sign in with Tesla.** Open `https://<your-domain>/login` in a browser, sign in to Tesla, and approve the
    scopes. Tesla sends you back to `/callback`, which exchanges the code, stores the tokens encrypted (replacing
    any stored ones), and shows `Tesla sign-in updated, scopes: ...` with the scopes Tesla granted. The link from
-   `/login` works once, for ten minutes. The redirect URI sent to Tesla is this origin's `/callback`; set
-   `TESLA_REDIRECT_URI` to pin one exact value (it must match the developer app's redirect URI exactly). Tesla
+   `/login` works once, for ten minutes. The redirect URI sent to Tesla is `${OAUTH_REDIRECT_BASE}/callback`, from the
+   non-secret `OAUTH_REDIRECT_BASE` var in `wrangler.jsonc` (an https URL; a trailing slash is dropped). It is
+   never taken from the request host, and it must match a redirect URI in the developer app exactly. Tesla
    rotates refresh tokens and the Worker keeps the newest, so do not share this sign-in with another Tesla tool:
    whichever one refreshes second is locked out.
 
@@ -333,6 +334,12 @@ from it). Node 22 or newer.
    Instead of the browser, you can complete Tesla's authorization-code flow elsewhere and store the refresh token
    with `npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. It seeds the encrypted token store once per
    distinct value; a browser sign-in supersedes the value set at the time.
+
+   **Moving sign-in to another domain.** Set `OAUTH_REDIRECT_BASE` in `wrangler.jsonc` to the new
+   `https://<base>` and deploy, register `https://<base>/callback` as a redirect URI (and the origin as an allowed
+   origin) in the developer app at developer.tesla.com, and route the domain to the Worker (Domains & Routes →
+   Custom domain). A `/login` link opened before the change no longer completes; start again at `/login`. If the
+   var is missing or not an https URL, `/login` and `/callback` show a configuration error and change nothing.
 
    **Signing in again (`reauth_required`).** If Tesla rejects the stored sign-in (a revoked or expired refresh
    token), every tool fails with `reauth_required`, a code-only error is logged, and no further refreshes are tried.

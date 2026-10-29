@@ -14,6 +14,9 @@ afterEach(() => {
 });
 
 const BASE = "https://tesla-mcp.example";
+/** OAUTH_REDIRECT_BASE (vitest.config.ts, with a trailing slash) + /callback:
+ * another host than BASE, so nothing comes from the request. */
+const REDIRECT_URI = "https://sign-in.example.net/callback";
 const SCOPES = [
   "openid",
   "offline_access",
@@ -96,7 +99,7 @@ describe("GET /login", () => {
     const params = location.searchParams;
     expect(params.get("response_type")).toBe("code");
     expect(params.get("client_id")).toBe("test-client-id");
-    expect(params.get("redirect_uri")).toBe(`${BASE}/callback`);
+    expect(params.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(params.get("scope")).toBe(SCOPES.join(" "));
     expect(params.get("scope")?.split(" ")).toHaveLength(9);
     expect(params.get("prompt_missing_scopes")).toBe("true");
@@ -104,14 +107,40 @@ describe("GET /login", () => {
     expect(await browser(ownerId).login()).not.toBe(params.get("state"));
   });
 
-  it("uses TESLA_REDIRECT_URI when set, and refuses when it or the client id is unusable", async () => {
+  it("takes the redirect URI from OAUTH_REDIRECT_BASE whatever the request host", async () => {
     const ownerId = uniqueName("login");
-    const fixed = "https://cars.example.net/callback";
-    const configured = await browser(ownerId, { TESLA_REDIRECT_URI: fixed }).get("/login");
-    expect(new URL(configured.headers.get("Location") as string).searchParams.get("redirect_uri")).toBe(fixed);
-    for (const overrides of [{ TESLA_REDIRECT_URI: "not a url" }, { TESLA_REDIRECT_URI: "javascript:alert(1)" }]) {
-      expect((await browser(ownerId, overrides).get("/login")).status).toBe(503);
+    for (const host of ["https://tesla-mcp.example", "https://attacker.example", "http://localhost:8787"]) {
+      const response = await handleRequest(new Request(`${host}/login`), env, undefined, ownerId);
+      expect(new URL(response.headers.get("Location") as string).searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
     }
+    const custom = await browser(ownerId, { OAUTH_REDIRECT_BASE: " https://cars.example.net/base// " }).get("/login");
+    expect(new URL(custom.headers.get("Location") as string).searchParams.get("redirect_uri")).toBe(
+      "https://cars.example.net/base/callback",
+    );
+  });
+
+  it("shows a configuration error when OAUTH_REDIRECT_BASE or the client id is unusable", async () => {
+    const ownerId = uniqueName("login");
+    for (const base of [
+      "",
+      "   ",
+      "not a url",
+      "javascript:alert(1)",
+      "http://cars.example.net",
+      "https://user:pass@cars.example.net",
+      "https://cars.example.net/?next=x",
+      "https://cars.example.net/#x",
+    ]) {
+      for (const path of ["/login", "/callback?code=abc&state=x"]) {
+        const response = await browser(ownerId, { OAUTH_REDIRECT_BASE: base }).get(path);
+        expect(response.status).toBe(503);
+        expect(response.headers.get("Content-Type")).toBe("text/html; charset=utf-8");
+        expect(await response.text()).toContain("OAUTH_REDIRECT_BASE must be an https URL");
+      }
+    }
+    const { OAUTH_REDIRECT_BASE: _omitted, ...missing } = env;
+    const unset = await handleRequest(new Request(`${BASE}/login`), missing as typeof env, undefined, ownerId);
+    expect(unset.status).toBe(503);
     expect((await browser(ownerId, { TESLA_CLIENT_ID: "" }).get("/login")).status).toBe(503);
     // HEAD never creates a sign-in.
     expect((await browser(ownerId).get("/login", "HEAD")).status).toBe(404);
@@ -142,7 +171,7 @@ describe("GET /callback", () => {
     expect([...form.keys()]).toEqual(["grant_type", "code", "redirect_uri", "client_id", "audience"]);
     expect(form.get("grant_type")).toBe("authorization_code");
     expect(form.get("code")).toBe(code);
-    expect(form.get("redirect_uri")).toBe(`${BASE}/callback`);
+    expect(form.get("redirect_uri")).toBe(REDIRECT_URI);
     expect(form.get("audience")).toBe(env.TESLA_FLEET_BASE_URL);
 
     const after = await storedTokens(ownerId);
@@ -210,6 +239,17 @@ describe("GET /callback", () => {
       instance.clock = () => start + 10 * 60_000 + 1;
     });
     expect((await flow.get(`/callback?code=abc&state=${state}`)).status).toBe(400);
+    expect(fake.tokenRequests).toHaveLength(0);
+  });
+
+  it("refuses a state from before OAUTH_REDIRECT_BASE changed, without calling Tesla", async () => {
+    const fake = tesla();
+    const ownerId = uniqueName("callback");
+    const state = await browser(ownerId).login();
+    const moved = browser(ownerId, { OAUTH_REDIRECT_BASE: "https://cars.example.net" });
+    const response = await moved.get(`/callback?code=abc&state=${state}`);
+    expect(response.status).toBe(400);
+    expect(await response.text()).toMatch(/Start again at \/login/);
     expect(fake.tokenRequests).toHaveLength(0);
   });
 
@@ -329,8 +369,10 @@ describe("GET /callback", () => {
     const secret = `secret-${crypto.randomUUID()}`;
     await runInDurableObject(owner(uniqueName("callback")), async (instance: OwnerState) => {
       Object.assign(instance, { env: { ...env, TESLA_CLIENT_SECRET: secret } });
-      const state = await instance.beginSignIn(`${BASE}/callback`);
-      expect(await instance.completeSignIn({ state, code: "abc", error: null })).toMatchObject({ ok: true });
+      const state = await instance.beginSignIn(REDIRECT_URI);
+      expect(
+        await instance.completeSignIn({ state, code: "abc", error: null, redirectUri: REDIRECT_URI }),
+      ).toMatchObject({ ok: true });
     });
     expect(fake.tokenRequests.at(-1)?.get("grant_type")).toBe("authorization_code");
     expect(fake.tokenRequests.at(-1)?.get("client_secret")).toBe(secret);

@@ -12,6 +12,9 @@ export interface Env {
   TESLA_AUTH_TOKEN_URL: string;
   TESLA_PUBLIC_KEY_PEM: string;
   DANGEROUS_COMMANDS_ENABLED: string;
+  /** https origin (or base URL) Tesla redirects to: sign-in uses
+   * `${OAUTH_REDIRECT_BASE}/callback`. */
+  OAUTH_REDIRECT_BASE: string;
 
   MCP_BEARER_TOKEN?: string;
   TESLA_CLIENT_ID?: string;
@@ -20,6 +23,4 @@ export interface Env {
   TOKEN_ENCRYPTION_KEY?: string;
   TESLA_BOOTSTRAP_REFRESH_TOKEN?: string;
   TESLA_VEHICLE_ID?: string;
-  /** The redirect URI registered with Tesla. Unset: this origin's /callback. */
-  TESLA_REDIRECT_URI?: string;
 }

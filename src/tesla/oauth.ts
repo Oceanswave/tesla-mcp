@@ -34,18 +34,20 @@ export function authorizeUrl(input: { clientId: string; redirectUri: string; sta
   return url.toString();
 }
 
-/** The redirect URI registered with Tesla: TESLA_REDIRECT_URI when set,
- * otherwise this origin's /callback. Null when the setting is not an
- * http(s) URL. */
-export function signInRedirectUri(configured: string | undefined, requestUrl: URL): string | null {
-  const value = configured?.trim();
-  if (!value) return `${requestUrl.origin}/callback`;
+/** The redirect URI registered with Tesla: OAUTH_REDIRECT_BASE (trailing
+ * slashes dropped) + /callback. Never derived from the request. Null when the
+ * base is missing or not a plain https URL. */
+export function signInRedirectUri(base: string | undefined): string | null {
+  const value = base?.trim().replace(/\/+$/, "");
+  if (!value) return null;
+  let url: URL;
   try {
-    const url = new URL(value);
-    return url.protocol === "https:" || url.protocol === "http:" ? url.toString() : null;
+    url = new URL(value);
   } catch {
     return null;
   }
+  if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return null;
+  return `${value}/callback`;
 }
 
 export type AccessTokenClaims = { sub: string | null; scopes: string[] | null };
