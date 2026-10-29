@@ -28,6 +28,6 @@
     // Public by definition: Tesla fetches it from
     // /.well-known/appspecific/com.tesla.3p.public-key.pem.
     "TESLA_PUBLIC_KEY_PEM": "-----BEGIN PUBLIC KEY-----\nMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEzU4sPRPe2N2yXYwhSgMjPAVW6Voq\nfHxe3wguACnHbh7buD93WNbnVSvCcPyCBtYRoj3m4MEoOlKtMah7cKH2OQ==\n-----END PUBLIC KEY-----\n",
-    "DANGEROUS_COMMANDS_ENABLED": "false"
+    "DANGEROUS_COMMANDS_ENABLED": "true"
   }
 }
