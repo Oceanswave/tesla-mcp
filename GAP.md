@@ -47,9 +47,10 @@ registered when `DANGEROUS_COMMANDS_ENABLED` is `"true"`.
   `tesla_windows_vent`. Energy tools start with `tesla_energy_`, account tools with `tesla_account_`, other
   vehicle REST tools with `tesla_vehicle_`. The six existing tool names are unchanged.
 - **Inputs:** every input schema is strict (unknown arguments are rejected). Vehicle tools take an optional
-  `vehicle_id` and energy tools an optional `energy_site_id`; either can be left out when the account has only
-  one. Parameters are typed enums and ranges (seat names, `low`/`medium`/`high`, 50-100 %), not Tesla's raw
-  integers, and are checked again by the payload builder before anything is signed.
+  `vehicle_id` (an id or VIN) and energy tools an optional `energy_site_id`; a vehicle tool without one uses
+  `DEFAULT_VIN` when set, and either can be left out when the account has only one. Parameters are typed enums
+  and ranges (seat names, `low`/`medium`/`high`, 50-100 %), not Tesla's raw integers, and are checked again by
+  the payload builder before anything is signed.
 - **Confirmation:** every tool that changes a vehicle or energy product requires `confirm: true` and supports
   `dryRun: true`. Refusals and dry runs are audited. Read tools take neither. Two tools that only read are
   `POST`s or signed messages under the hood (`tesla_vehicle_fleet_status`, `tesla_vehicle_ping`); they change

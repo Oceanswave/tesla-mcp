@@ -2,7 +2,8 @@
 # and fill in. In production set each with `wrangler secret put NAME`.
 # Every value below is a placeholder.
 
-# Static bearer token MCP clients send as "Authorization: Bearer <token>".
+# Static bearer token MCP clients send as "Authorization: Bearer <token>". It
+# also guards the /admin/clients API.
 # Generate: openssl rand -base64 32
 MCP_BEARER_TOKEN=replace-with-a-long-random-string
 
@@ -26,6 +27,7 @@ TOKEN_ENCRYPTION_KEY=replace-with-base64-32-bytes
 # same value is never seeded twice, and a browser sign-in supersedes it.
 TESLA_BOOTSTRAP_REFRESH_TOKEN=replace-with-a-refresh-token
 
-# Optional: the Fleet vehicle id to target. If unset and the account has one
-# vehicle, that vehicle is used; otherwise tools need vehicle_id.
-TESLA_VEHICLE_ID=
+# Passphrase the owner types on /authorize to approve an OAuth MCP client
+# (Claude's connector, or a static client from /admin/clients). Unset: every
+# authorization is refused. Generate: openssl rand -base64 24
+OAUTH_ADMIN_PASSPHRASE=replace-with-a-long-random-passphrase

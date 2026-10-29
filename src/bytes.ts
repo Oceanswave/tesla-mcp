@@ -69,3 +69,12 @@ export async function sha256(data: Uint8Array): Promise<Uint8Array> {
 export function random16(): Uint8Array {
   return crypto.getRandomValues(new Uint8Array(16));
 }
+
+const encoder = new TextEncoder();
+
+/** Compare a presented secret with the expected one without leaking either
+ * its content or its length through timing: both are hashed first. */
+export async function secretsEqual(presented: string, expected: string): Promise<boolean> {
+  const [left, right] = await Promise.all([sha256(encoder.encode(presented)), sha256(encoder.encode(expected))]);
+  return constantTimeEqual(left, right);
+}

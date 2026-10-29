@@ -34,7 +34,9 @@ export default defineConfig({
           TESLA_CLIENT_ID: "test-client-id",
           TESLA_CLIENT_SECRET: "",
           TESLA_BOOTSTRAP_REFRESH_TOKEN: `test-bootstrap-${randomToken(24)}`,
-          TESLA_VEHICLE_ID: "",
+          DEFAULT_VIN: "",
+          OAUTH_EXTRA_REDIRECT_URIS: "",
+          OAUTH_ADMIN_PASSPHRASE: randomToken(24),
           // A host unlike the one test requests use: the redirect URI must come
           // from this var, never from the request.
           OAUTH_REDIRECT_BASE: "https://sign-in.example.net/",

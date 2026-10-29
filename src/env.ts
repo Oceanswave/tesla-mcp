@@ -7,6 +7,9 @@ import type { TeslaVcpSession } from "./tesla/vcp/session";
 export interface Env {
   OWNER: DurableObjectNamespace<OwnerState>;
   TESLA_VCP: DurableObjectNamespace<TeslaVcpSession>;
+  /** OAuth front door (src/oauth/): server-issued tokens, registered clients,
+   * one-time approval tokens, and failed-passphrase counters. */
+  OAUTH_KV: KVNamespace;
 
   TESLA_FLEET_BASE_URL: string;
   TESLA_AUTH_TOKEN_URL: string;
@@ -15,6 +18,12 @@ export interface Env {
   /** https origin (or base URL) Tesla redirects to: sign-in uses
    * `${OAUTH_REDIRECT_BASE}/callback`. */
   OAUTH_REDIRECT_BASE: string;
+  /** Vehicle used when a tool gets no vehicle_id: a VIN or Fleet vehicle id.
+   * Empty means "the account's only vehicle". */
+  DEFAULT_VIN: string;
+  /** Comma-separated redirect URIs allowed for OAuth clients beyond the
+   * built-in Claude and loopback ones. */
+  OAUTH_EXTRA_REDIRECT_URIS: string;
 
   MCP_BEARER_TOKEN?: string;
   TESLA_CLIENT_ID?: string;
@@ -22,5 +31,6 @@ export interface Env {
   TESLA_COMMAND_PRIVATE_KEY_PKCS8_B64?: string;
   TOKEN_ENCRYPTION_KEY?: string;
   TESLA_BOOTSTRAP_REFRESH_TOKEN?: string;
-  TESLA_VEHICLE_ID?: string;
+  /** Passphrase the owner types on /authorize to approve a client. */
+  OAUTH_ADMIN_PASSPHRASE?: string;
 }
