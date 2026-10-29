@@ -25,4 +25,4 @@ jobs:
       runs-on: '["self-hosted","Linux","X64","tesla-mcp"]'
       head-branch: ${{ github.event.workflow_run.head_branch }}
       expected-head: ${{ github.event.workflow_run.head_sha }}
-      required-checks: '[{"name":"verify","appId":15368}]'
+      required-checks: '[{"name":"verify","appId":15368},{"name":"secret-scan","appId":15368},{"name":"go-conformance","appId":15368},{"name":"deploy-dry-run / Wrangler deploy","appId":15368}]'
