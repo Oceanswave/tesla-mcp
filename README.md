@@ -2,8 +2,8 @@
 
 A private [Model Context Protocol](https://modelcontextprotocol.io) server for one Tesla owner, running on
 Cloudflare Workers. It gives an assistant, or any Streamable HTTP MCP client or script, plain tools to check the car
-and lock it. Schedules and routines belong to the caller; see [`scripts/nightly-lock/`](scripts/nightly-lock/) for
-an example that locks the car every night from a systemd timer.
+and lock it. The server has no schedules or routines of its own: anything recurring, such as a nightly lock, is run
+by the caller (see [Locking on a schedule](#locking-on-a-schedule)).
 
 Lock is sent as a signed Vehicle Command Protocol message (the VCSEC domain), so it works on vehicles that require
 Tesla's command signing. The signer is a WebCrypto port checked byte for byte against the hermes-tescmd-plugin
@@ -14,14 +14,14 @@ OAuth is planned; the auth and storage seams are already in place for it.
 
 ## Tools
 
-| Tool                        | Kind    | What it does                                                                                                                                                                |
-| --------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tesla_vehicles_list`       | read    | Cars on the account with id, name, and online/asleep/offline.                                                                                                               |
-| `tesla_vehicle_status`      | read    | Online or asleep; when online: locked, open doors/trunks/windows, battery, range, charging, temperatures, climate, Sentry Mode, odometer. Never wakes the car. No location. |
-| `tesla_wake`                | command | Wake the car.                                                                                                                                                               |
-| `tesla_lock`                | command | Lock the doors with a signed command. Wakes the car, waits for it, retries, and reads the lock state back.                                                                  |
-| `tesla_nightly_lock_status` | read    | Deprecated, removed with the built-in nightly lock: its time, next run, last result, and sign-in state.                                                                     |
-| `tesla_audit_recent`        | read    | Newest audit log entries (default 20).                                                                                                                                      |
+| Tool                   | Kind    | What it does                                                                                                                                                                |
+| ---------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tesla_vehicles_list`  | read    | Cars on the account with id, name, and online/asleep/offline.                                                                                                               |
+| `tesla_vehicle_status` | read    | Online or asleep; when online: locked, open doors/trunks/windows, battery, range, charging, temperatures, climate, Sentry Mode, odometer. Never wakes the car. No location. |
+| `tesla_wake`           | command | Wake the car.                                                                                                                                                               |
+| `tesla_lock`           | command | Lock the doors with a signed command. Wakes the car, waits for it, retries, and reads the lock state back.                                                                  |
+| `tesla_auth_status`    | read    | Tesla sign-in state: `ok`, `reauth_required`, or `not_configured`. Reads stored state only; never contacts Tesla.                                                           |
+| `tesla_audit_recent`   | read    | Newest audit log entries (default 20).                                                                                                                                      |
 
 ## Safety model
 
@@ -30,8 +30,8 @@ OAuth is planned; the auth and storage seams are already in place for it.
 - **No dangerous commands.** Unlock, remote start, opening trunks/frunk/windows, valet/PIN/speed-limit changes,
   HomeLink, and data erase are not implemented. A single gate (`DANGEROUS_COMMANDS_ENABLED`, default `"false"`)
   must be explicitly enabled before any such tool could even be registered.
-- **Never wakes implicitly.** Status reads report "asleep" instead of waking the car. Only `tesla_wake`,
-  `tesla_lock`, and the deprecated built-in nightly lock wake it.
+- **Never wakes implicitly.** Status reads report "asleep" instead of waking the car. Only `tesla_wake` and
+  `tesla_lock` wake it.
 - **Explicit command allowlist.** The signer can only build the commands it names (today: door lock). It is not a
   generic vehicle-command proxy.
 - **Secrets stay secret.** Tesla tokens are stored AES-256-GCM encrypted in a Durable Object. Tokens, keys, and
@@ -49,25 +49,20 @@ that still reports unlocked gets another attempt. The result says `locked`, `con
 locked), `woke`, and `attempts`. A failure carries `error` and a specific `reason` such as `pairing_required`,
 `wake_timeout`, `still_unlocked`, or `reauth_required`.
 
-## Built-in nightly lock (deprecated)
+## Locking on a schedule
 
-Scheduling is the caller's job, and this alarm is being replaced by the outside caller in
-[`scripts/nightly-lock/`](scripts/nightly-lock/). It stays on (`NIGHTLY_LOCK_ENABLED="true"`) until that caller has
-run successfully; then it is switched off and removed, with its cron trigger, `tesla_nightly_lock_status`, and the
-`NIGHTLY_LOCK_*` settings.
+The server runs nothing on its own. To lock the car every night (or on any other schedule), let your own scheduler
+(cron, a systemd timer, an assistant's routine, a CI job) call the MCP tools at `https://<your-domain>/mcp` with
+`Authorization: Bearer <MCP_BEARER_TOKEN>`:
+1. Optionally call `tesla_auth_status`. If `authState` is `reauth_required`, alert the owner to sign in again
+   (below) instead of trying to lock.
+2. Call `tesla_lock` with `{"confirm": true}` (and `vehicle_id` if the account has more than one car). Allow the
+   call up to about 8 minutes: an asleep car is woken and retried within the 7-minute budget.
+3. Treat `locked: true` as success; `confirmed: false` means Tesla accepted the lock but the car's state could not
+   be read back. On `isError`, alert on `error` and `reason` (for example `reauth_required`, `pairing_required`,
+   `wake_timeout`, `still_unlocked`). Do not loop on failures: the tool has already retried.
 
-At `NIGHTLY_LOCK_TIME` in `NIGHTLY_LOCK_TIMEZONE` (default 22:00 America/New_York, correct across daylight saving
-changes), a Durable Object alarm sends the signed lock. If the car is asleep or offline it is woken, polled until
-online (up to about 90 seconds), and the lock is retried, up to 4 attempts in total. An already locked car counts as
-success. Failures Tesla marks as not retryable stop at once. If a lock response is lost, or the car only
-acknowledges the command without confirming it ran, the car's lock state is checked instead of sending the lock
-again. The whole run stops starting new attempts after 7 minutes, well inside the 15-minute limit Cloudflare gives an
-alarm. A night that finished never runs again. A run interrupted part way (for example, the Durable Object was
-restarted) is resumed up to 3 times, within 3 hours of the scheduled time, and a resumed run checks whether the car
-is already locked before sending anything. After that it is audited as missed or abandoned. If an outage delays the
-alarm past the next night's lock time, that night still runs (within the same 3-hour window) instead of being
-skipped. Every run is audited. A cron trigger every 15 minutes keeps the alarm armed; it does nothing else, so right
-after a first deploy `tesla_nightly_lock_status` shows no next run until the first cron tick.
+Every call is in the audit log (`tesla_audit_recent`).
 
 ## Self-hosting
 

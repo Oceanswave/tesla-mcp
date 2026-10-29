@@ -1,5 +1,5 @@
 name: PR auto-merge (green CI)
-# Sean's rule: if a PR passes CI, merge it. Calls the shared merge helper after
+# Repository rule: if a PR passes CI, merge it. Calls the shared merge helper after
 # CI completes on a same-repo pull request; the helper re-checks reviews, holds
 # (draft, requested review, unresolved threads, changes requested), and that every
 # check on the exact head is green before squash-merging. Self-hosted runner only.

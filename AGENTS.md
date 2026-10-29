@@ -18,23 +18,23 @@ and of the lock retry logic matters more than speed.
   `test/vectors/vcsec-lock.json` (or a sibling file) plus `conformance/go/` so Tesla's Go code checks them. Anything
   that unlocks, opens, starts, or weakens security must declare a `dangerousAction` (see `src/mcp/dangerous.ts`)
   so it stays unregistered unless `DANGEROUS_COMMANDS_ENABLED` is `"true"`.
+- No schedules, routines, alarms, or cron triggers in the Worker, and no owner-specific callers in this repo: a
+  routine (such as a nightly lock) runs in the caller and calls the MCP tools.
 - Every state-changing tool requires `confirm: true` and supports `dryRun: true` (via `commandGate` in
   `src/mcp/server.ts`). Read tools must never wake the car.
 - CI uses `pull_request` (never `pull_request_target`), `contents: read`, and actions pinned by full SHA.
 
 ## Layout
 
-- `src/index.ts`: the Worker entry: fetch and cron handlers and the Durable Object classes only (workerd refuses
+- `src/index.ts`: the Worker entry: the fetch handler and the Durable Object classes only (workerd refuses
   any other export from the entry module).
 - `src/routes.ts`: routes, security headers, `/mcp` transport.
 - `src/auth.ts`: `McpAuthenticator` interface and the bearer-token implementation.
 - `src/mcp/`: tool definitions and the dangerous-command gate.
-- `src/owner/`: `OwnerState` Durable Object (encrypted tokens, audit log, command lane, and the deprecated
-  built-in nightly alarm), schedule math, the lock retry policy, token encryption.
+- `src/owner/`: `OwnerState` Durable Object (encrypted tokens, sign-in state, audit log, command lane), the lock
+  retry policy, token encryption.
 - `src/tesla/`: Fleet REST client, bounded HTTP helpers, and `vcp/` (Vehicle Command Protocol codec, crypto, and
   the per-VIN `TeslaVcpSession` Durable Object).
-- `scripts/nightly-lock/`: the owner's own routine, outside the server: a script that calls `tesla_lock` over MCP
-  and a systemd timer for 22:00 America/New_York. Schedules belong here, not in the Worker.
 - `test/`: Workers-runtime tests with a simulated Tesla in `test/helpers/fake-tesla.ts`.
 - `conformance/`: a Go test compiled inside a pinned checkout of Tesla's `vehicle-command` (its signer is in
   `internal/`) that rebuilds `test/vectors/vcsec-lock.json` with Tesla's code.
