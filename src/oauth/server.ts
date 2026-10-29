@@ -54,6 +54,11 @@ export function authorizationServer(url: URL, env: Env): OAuthAuthorizationServe
     clientRegistrationEndpoint: REGISTER_PATH,
     clientRegistrationCallback: ({ clientMetadata }) => {
       if (allowedRedirectUris(clientMetadata.redirect_uris, { OAUTH_EXTRA_REDIRECT_URIS: extra })) return;
+      // Redirect URIs are public client metadata (no secrets); log them so the owner can allow a new client.
+      const rejected = Array.isArray(clientMetadata.redirect_uris)
+        ? clientMetadata.redirect_uris.slice(0, 10).map((u) => String(u).slice(0, 300))
+        : [];
+      console.warn();
       return {
         code: "invalid_redirect_uri",
         description:
