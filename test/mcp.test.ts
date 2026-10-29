@@ -1,9 +1,11 @@
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { McpAuthenticator } from "../src/auth";
 import { handleRequest } from "../src/index";
 import { DANGEROUS_ACTIONS, type DangerousAction, gateTools } from "../src/mcp/dangerous";
+import type { OwnerState } from "../src/owner/state";
 import { FakeTesla, uniqueName } from "./helpers/fake-tesla";
 
 const ENDPOINT = "https://tesla-mcp.example/mcp";
@@ -129,6 +131,46 @@ describe("MCP over the real /mcp handler", () => {
     expect(audit.structuredContent?.entries).toEqual(
       expect.arrayContaining([expect.objectContaining({ action: "lock" })]),
     );
+    await client.close();
+  });
+
+  it("wakes an asleep car, waits for it, locks, and reads the lock state back", async () => {
+    const tesla = new FakeTesla();
+    tesla.state = "asleep";
+    tesla.pollsUntilOnline = 2;
+    tesla.install();
+    const { client, owner } = await connect();
+    await runInDurableObject(owner, (instance: OwnerState) => {
+      instance.sleep = async () => {};
+    });
+    await runInDurableObject(env.TESLA_VCP.get(env.TESLA_VCP.idFromName(tesla.vin)), (instance) => {
+      instance.sleep = async () => {};
+    });
+    const result = (await client.callTool({ name: "tesla_lock", arguments: { confirm: true } })) as ToolResult;
+    expect(result.isError).toBeFalsy();
+    expect(result.structuredContent).toMatchObject({
+      summary: "The car woke up and is now locked.",
+      locked: true,
+      confirmed: true,
+      detail: "locked_after_wake",
+      woke: true,
+      attempts: 1,
+    });
+    expect(tesla.car.locked).toBe(true);
+    expect(tesla.fleetRequests.filter((request) => request.path.endsWith("/wake_up"))).toHaveLength(1);
+    expect(tesla.fleetRequests.some((request) => request.path.endsWith("/vehicle_data"))).toBe(true);
+    await client.close();
+  });
+
+  it("names the specific reason when the lock fails", async () => {
+    const tesla = new FakeTesla();
+    tesla.car.handshakeFault = 3;
+    tesla.install();
+    const { client } = await connect();
+    const result = (await client.callTool({ name: "tesla_lock", arguments: { confirm: true } })) as ToolResult;
+    expect(result.isError).toBe(true);
+    expect(result.structuredContent).toMatchObject({ error: "command_failed", reason: "pairing_required" });
+    expect(String(result.structuredContent?.summary)).toMatch(/Pair the virtual key/);
     await client.close();
   });
 

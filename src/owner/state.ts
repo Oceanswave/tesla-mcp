@@ -8,14 +8,7 @@ import type { Env } from "../env";
 import { FleetClient, FleetError, summarizeVehicleData, type VehicleSummary } from "../tesla/fleet";
 import { defaultFetch, type FetchFn, fetchUpstream, readBoundedText } from "../tesla/http";
 import type { SignedCommandResult } from "../tesla/vcp/session";
-import {
-  INTERACTIVE_LOCK_POLICY,
-  type LockOptions,
-  type LockOutcome,
-  type LockPolicy,
-  lockWithRetry,
-  NIGHTLY_LOCK_POLICY,
-} from "./lock";
+import { LOCK_POLICY, type LockFailureCode, type LockOptions, type LockOutcome, lockWithRetry } from "./lock";
 import {
   computeLatestRun,
   computeNextRun,
@@ -75,7 +68,11 @@ export type OwnerErrorCode =
   | "rate_limited"
   | "command_failed";
 
-export type OwnerResult<T> = { ok: true; data: T } | { ok: false; error: { code: OwnerErrorCode; message: string } };
+/** `reason` names the specific lock failure (pairing_required, wake_timeout,
+ * still_unlocked, ...) so a caller can act on it without parsing prose. */
+export type OwnerFailure = { code: OwnerErrorCode; message: string; reason?: LockFailureCode };
+
+export type OwnerResult<T> = { ok: true; data: T } | { ok: false; error: OwnerFailure };
 
 class OwnerError extends Error {
   constructor(
@@ -444,7 +441,7 @@ export class OwnerState extends DurableObject<Env> {
     return run;
   }
 
-  private failure(error: unknown): { ok: false; error: { code: OwnerErrorCode; message: string } } {
+  private failure(error: unknown): { ok: false; error: OwnerFailure } {
     if (error instanceof OwnerError) return { ok: false, error: { code: error.code, message: error.message } };
     if (error instanceof FleetError) {
       if (error.code === "rate_limited") {
@@ -526,14 +523,15 @@ export class OwnerState extends DurableObject<Env> {
     });
   }
 
+  /** Lock the car: wake it if needed, poll until online, retry, and read the
+   * lock state back. The same policy serves every caller. */
   async lock(input: { vehicleId?: string }): Promise<OwnerResult<LockSuccess>> {
-    return this.inLane(() => this.lockFlow("tool", input.vehicleId, INTERACTIVE_LOCK_POLICY));
+    return this.inLane(() => this.lockFlow("tool", input.vehicleId, false, { confirmLocked: true }));
   }
 
   private async lockFlow(
     source: AuditSource,
     vehicleId: string | undefined,
-    policy: LockPolicy,
     rethrowUnexpected = false,
     options: LockOptions = {},
   ): Promise<OwnerResult<LockSuccess>> {
@@ -585,13 +583,17 @@ export class OwnerState extends DurableObject<Env> {
           sleep: (milliseconds) => this.sleep(milliseconds),
           now: () => this.clock(),
         },
-        policy,
+        LOCK_POLICY,
         options,
       );
-      const detail = `${outcome.ok ? outcome.detail : `${outcome.code} ${outcome.detail}`} attempts=${outcome.attempts}${outcome.woke ? " woke" : ""}`;
+      const detail = `${outcome.ok ? outcome.detail : `${outcome.code} ${outcome.detail}`} attempts=${outcome.attempts}${outcome.woke ? " woke" : ""}${outcome.ok && outcome.confirmed ? " confirmed" : ""}`;
       this.audit({ source, action: "lock", vehicleId: vehicle.id, outcome: outcome.ok ? "ok" : "error", detail });
       if (outcome.ok) return { ok: true, data: { ...outcome, vehicleId: vehicle.id } };
-      return { ok: false, error: { code: "command_failed", message: lockFailureMessage(outcome) } };
+      // A signed command Tesla still refuses after a forced token refresh
+      // means the account's sign-in is no longer accepted.
+      const code: OwnerErrorCode = outcome.code === "unauthorized" ? "reauth_required" : "command_failed";
+      const message = code === "reauth_required" ? REAUTH_MESSAGE : lockFailureMessage(outcome);
+      return { ok: false, error: { code, message, reason: outcome.code } };
     } catch (error) {
       // Anything that is not a Tesla or owner error (a lost Durable Object
       // call, a reset) interrupted the run; the nightly alarm resumes it.
@@ -744,9 +746,7 @@ export class OwnerState extends DurableObject<Env> {
     try {
       // An unexpected error propagates and leaves the run pending.
       // A resumed run may have locked the car before it was interrupted.
-      result = await this.inLane(() =>
-        this.lockFlow("alarm", undefined, NIGHTLY_LOCK_POLICY, true, { checkLockedFirst: resumed !== null }),
-      );
+      result = await this.inLane(() => this.lockFlow("alarm", undefined, true, { checkLockedFirst: resumed !== null }));
     } finally {
       this.nightlyInFlight = false;
     }
@@ -835,6 +835,8 @@ function lockFailureMessage(outcome: Extract<LockOutcome, { ok: false }>): strin
       return `The car did not respond after ${outcome.attempts} tries. It may be out of coverage.`;
     case "status_unknown":
       return "Tesla did not confirm the lock. Check the car before trying again.";
+    case "still_unlocked":
+      return "Tesla accepted the lock, but the car still reports unlocked. A door, trunk, or frunk may be open.";
     default:
       return `The lock did not go through after ${outcome.attempts} tries.`;
   }

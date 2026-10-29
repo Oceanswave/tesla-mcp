@@ -1,7 +1,7 @@
 import { type CallToolResult, McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import type { Env } from "../env";
-import type { AuditRow, OwnerState } from "../owner/state";
+import type { AuditRow, OwnerFailure, OwnerState } from "../owner/state";
 import { type DangerousAction, dangerousCommandsEnabled, gateTools } from "./dangerous";
 
 export const SERVER_VERSION = "0.1.0";
@@ -50,8 +50,15 @@ function result(value: Record<string, unknown>, isError = false): CallToolResult
   };
 }
 
-function failure(error: { code: string; message: string }): CallToolResult {
-  return result({ summary: error.message, error: error.code }, true);
+function failure(error: OwnerFailure | { code: "internal_error"; message: string }): CallToolResult {
+  return result(
+    {
+      summary: error.message,
+      error: error.code,
+      ...("reason" in error && error.reason ? { reason: error.reason } : {}),
+    },
+    true,
+  );
 }
 
 /** Every state-changing tool goes through this gate: no confirm, no action;
@@ -162,24 +169,29 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_lock",
       description:
-        "Lock the car's doors with a signed command. Wakes the car first if it is asleep and retries if needed. Requires confirm set to true after the user asks. Locking an already locked car is fine.",
+        "Lock the car's doors with a signed command. Wakes the car if it is asleep, waits for it to come online, retries, and reads the lock state back; can take a few minutes when the car is asleep. Requires confirm set to true after the user asks. Locking an already locked car is fine. On failure, `reason` says why (for example pairing_required, wake_timeout, still_unlocked).",
       inputSchema: z.object({ vehicle_id: vehicleId, confirm, dryRun }).strict(),
       annotations: COMMAND,
       handler: (input) =>
         commandGate(owner, "lock", input, "lock the car", async () => {
           const locked = await owner.lock({ vehicleId: input.vehicle_id as string | undefined });
           if (!locked.ok) return failure(locked.error);
-          const summary =
-            locked.data.detail === "already_locked"
+          const { detail, confirmed } = locked.data;
+          let summary =
+            detail === "already_locked"
               ? "The car was already locked."
-              : locked.data.detail === "locked_after_wake"
+              : detail === "locked_after_wake"
                 ? "The car woke up and is now locked."
                 : "The car is locked.";
+          if (!confirmed) summary += " Tesla accepted the command, but the car's lock state could not be read back.";
           return result({
             summary,
+            locked: true,
+            confirmed,
             vehicleId: locked.data.vehicleId,
-            detail: locked.data.detail,
+            detail,
             attempts: locked.data.attempts,
+            woke: locked.data.woke,
           });
         }),
     },
@@ -241,7 +253,9 @@ export function createMcpServer(env: Env, owner: OwnerStub): McpServer {
       async (input: Record<string, unknown>) => {
         try {
           return await tool.handler(input);
-        } catch {
+        } catch (error) {
+          // The class name only: messages can carry upstream text.
+          console.error(`[tesla-mcp] ${tool.name} failed: ${error instanceof Error ? error.name : typeof error}`);
           return failure({
             code: "internal_error",
             message: "Something went wrong on the server. Nothing more was sent.",
