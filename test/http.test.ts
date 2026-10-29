@@ -73,6 +73,11 @@ describe("/mcp authentication", () => {
       raw.startsWith("{") ? raw : (raw.split("\n").find((line) => line.startsWith("data: ")) ?? "").slice(6),
     );
     expect(body.result.serverInfo.name).toBe("tesla-mcp");
+    expect(body.result.serverInfo.icons[0]).toEqual({
+      src: "https://www.evbackroads.com/pwa/icon-192.png",
+      mimeType: "image/png",
+      sizes: ["192x192"],
+    });
   });
 
   it("fails closed when MCP_BEARER_TOKEN is unset", async () => {

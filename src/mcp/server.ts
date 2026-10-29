@@ -14,6 +14,13 @@ import { type DangerousAction, dangerousCommandsEnabled, gateTools } from "./dan
 
 export const SERVER_VERSION = "0.1.0";
 
+/** Icons advertised in serverInfo (MCP 2025-06+); hosted on evbackroads.com. */
+export const SERVER_ICONS = [
+  { src: "https://www.evbackroads.com/pwa/icon-192.png", mimeType: "image/png", sizes: ["192x192"] },
+  { src: "https://www.evbackroads.com/pwa/icon-512.png", mimeType: "image/png", sizes: ["512x512"] },
+  { src: "https://www.evbackroads.com/pwa/app-icon.svg", mimeType: "image/svg+xml", sizes: ["any"] },
+];
+
 type OwnerStub = DurableObjectStub<OwnerState>;
 
 type ToolDefinition = {
@@ -358,7 +365,13 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
 }
 
 export function createMcpServer(env: Env, owner: OwnerStub): McpServer {
-  const server = new McpServer({ name: "tesla-mcp", version: SERVER_VERSION });
+  const server = new McpServer({
+    name: "tesla-mcp",
+    title: "Tesla MCP",
+    version: SERVER_VERSION,
+    websiteUrl: "https://www.evbackroads.com",
+    icons: SERVER_ICONS,
+  });
   for (const tool of gateTools(toolDefinitions(owner), dangerousCommandsEnabled(env))) {
     server.registerTool(
       tool.name,
