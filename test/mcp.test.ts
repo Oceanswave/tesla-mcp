@@ -15,7 +15,7 @@ afterEach(() => {
 });
 
 /** Each test acts as its own owner (its own OwnerState), through the real
- * /mcp handler, with the authenticator seam PR 2 will use for OAuth. */
+ * /mcp handler, with the authenticator seam a later OAuth sign-in will use. */
 async function connect(overrides: Partial<typeof env> = {}) {
   const ownerId = uniqueName("mcp-owner");
   const authenticator: McpAuthenticator = {

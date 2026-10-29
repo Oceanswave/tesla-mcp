@@ -419,8 +419,8 @@ export function validVIN(value: unknown): value is string {
 // VCSEC (DOMAIN_VEHICLE_SECURITY)
 // ---------------------------------------------------------------------------
 
-// vcsec.proto UnsignedMessage field 2: RKEAction_E. Values match the owner's
-// production Python plugin (protocol/payloads.py).
+// vcsec.proto UnsignedMessage field 2: RKEAction_E. Values match the
+// hermes-tescmd-plugin Python implementation (protocol/payloads.py).
 export const RKE_ACTION = { UNLOCK: 0, LOCK: 1 } as const;
 
 /** VCSEC UnsignedMessage { RKEAction_E RKEAction = 2 }. Proto3 omits a zero

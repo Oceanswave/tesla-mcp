@@ -24,13 +24,17 @@ and of the lock retry logic matters more than speed.
 
 ## Layout
 
-- `src/index.ts`: routes, security headers, `/mcp` transport, cron handler.
+- `src/index.ts`: the Worker entry: fetch and cron handlers and the Durable Object classes only (workerd refuses
+  any other export from the entry module).
+- `src/routes.ts`: routes, security headers, `/mcp` transport.
 - `src/auth.ts`: `McpAuthenticator` interface and the bearer-token implementation.
 - `src/mcp/`: tool definitions and the dangerous-command gate.
-- `src/owner/`: `OwnerState` Durable Object (encrypted tokens, audit log, nightly alarm, command lane), schedule
-  math, lock retry policy, token encryption.
+- `src/owner/`: `OwnerState` Durable Object (encrypted tokens, audit log, command lane, and the deprecated
+  built-in nightly alarm), schedule math, the lock retry policy, token encryption.
 - `src/tesla/`: Fleet REST client, bounded HTTP helpers, and `vcp/` (Vehicle Command Protocol codec, crypto, and
   the per-VIN `TeslaVcpSession` Durable Object).
+- `scripts/nightly-lock/`: the owner's own routine, outside the server: a script that calls `tesla_lock` over MCP
+  and a systemd timer for 22:00 America/New_York. Schedules belong here, not in the Worker.
 - `test/`: Workers-runtime tests with a simulated Tesla in `test/helpers/fake-tesla.ts`.
 - `conformance/`: a Go test compiled inside a pinned checkout of Tesla's `vehicle-command` (its signer is in
   `internal/`) that rebuilds `test/vectors/vcsec-lock.json` with Tesla's code.

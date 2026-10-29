@@ -291,7 +291,7 @@ export class OwnerState extends DurableObject<Env> {
   private async refresh(tokens: StoredTokens): Promise<string> {
     const clientId = this.env.TESLA_CLIENT_ID;
     if (!clientId) throw new OwnerError("not_configured", "TESLA_CLIENT_ID is not configured.");
-    // Same form the owner's Python plugin sends (client.refresh_access_token).
+    // Same form hermes-tescmd-plugin sends (client.refresh_access_token).
     const form = new URLSearchParams({
       grant_type: "refresh_token",
       refresh_token: tokens.refreshToken,

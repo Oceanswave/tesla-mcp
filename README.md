@@ -1,12 +1,13 @@
 # tesla-mcp
 
 A private [Model Context Protocol](https://modelcontextprotocol.io) server for one Tesla owner, running on
-Cloudflare Workers. It lets an assistant (Claude, Grok in the car, or any Streamable HTTP MCP client) check the
-car and lock it, and it locks the car automatically every night.
+Cloudflare Workers. It gives an assistant, or any Streamable HTTP MCP client or script, plain tools to check the car
+and lock it. Schedules and routines belong to the caller; see [`scripts/nightly-lock/`](scripts/nightly-lock/) for
+an example that locks the car every night from a systemd timer.
 
 Lock is sent as a signed Vehicle Command Protocol message (the VCSEC domain), so it works on vehicles that require
-Tesla's command signing. The signer is a WebCrypto port checked byte for byte against the owner's production
-Python implementation.
+Tesla's command signing. The signer is a WebCrypto port checked byte for byte against the hermes-tescmd-plugin
+Python implementation and against Tesla's Go implementation.
 
 **Status: owner-only MVP.** One owner, one static bearer token, one Tesla account. Multi-user sign-in with Tesla
 OAuth is planned; the auth and storage seams are already in place for it.
@@ -18,8 +19,8 @@ OAuth is planned; the auth and storage seams are already in place for it.
 | `tesla_vehicles_list`       | read    | Cars on the account with id, name, and online/asleep/offline.                                                                                                               |
 | `tesla_vehicle_status`      | read    | Online or asleep; when online: locked, open doors/trunks/windows, battery, range, charging, temperatures, climate, Sentry Mode, odometer. Never wakes the car. No location. |
 | `tesla_wake`                | command | Wake the car.                                                                                                                                                               |
-| `tesla_lock`                | command | Lock the doors with a signed command. Wakes the car and retries if needed.                                                                                                  |
-| `tesla_nightly_lock_status` | read    | Whether the nightly lock is on, its local time and zone, next run, last result.                                                                                             |
+| `tesla_lock`                | command | Lock the doors with a signed command. Wakes the car, waits for it, retries, and reads the lock state back.                                                                  |
+| `tesla_nightly_lock_status` | read    | Deprecated, removed with the built-in nightly lock: its time, next run, last result, and sign-in state.                                                                     |
 | `tesla_audit_recent`        | read    | Newest audit log entries (default 20).                                                                                                                                      |
 
 ## Safety model
@@ -30,7 +31,7 @@ OAuth is planned; the auth and storage seams are already in place for it.
   HomeLink, and data erase are not implemented. A single gate (`DANGEROUS_COMMANDS_ENABLED`, default `"false"`)
   must be explicitly enabled before any such tool could even be registered.
 - **Never wakes implicitly.** Status reads report "asleep" instead of waking the car. Only `tesla_wake`,
-  `tesla_lock`, and the nightly lock wake it.
+  `tesla_lock`, and the deprecated built-in nightly lock wake it.
 - **Explicit command allowlist.** The signer can only build the commands it names (today: door lock). It is not a
   generic vehicle-command proxy.
 - **Secrets stay secret.** Tesla tokens are stored AES-256-GCM encrypted in a Durable Object. Tokens, keys, and
@@ -38,7 +39,22 @@ OAuth is planned; the auth and storage seams are already in place for it.
 - **Fail closed.** No `MCP_BEARER_TOKEN` means every `/mcp` request is refused. A command key that does not match
   the published public key refuses to sign.
 
-## Nightly lock
+## Locking
+
+`tesla_lock` (with `confirm: true`) is the one lock, for assistants and scripts alike. If the car is asleep or
+offline it is woken and polled until online (up to about 90 seconds), and the lock is retried, up to 4 attempts
+within 7 minutes. Failures Tesla marks as not retryable stop at once. If a lock response is lost, the car's lock state
+is checked instead of sending the lock again. After Tesla accepts the lock, the car's lock state is read back; a car
+that still reports unlocked gets another attempt. The result says `locked`, `confirmed` (the car itself reported
+locked), `woke`, and `attempts`. A failure carries `error` and a specific `reason` such as `pairing_required`,
+`wake_timeout`, `still_unlocked`, or `reauth_required`.
+
+## Built-in nightly lock (deprecated)
+
+Scheduling is the caller's job, and this alarm is being replaced by the outside caller in
+[`scripts/nightly-lock/`](scripts/nightly-lock/). It stays on (`NIGHTLY_LOCK_ENABLED="true"`) until that caller has
+run successfully; then it is switched off and removed, with its cron trigger, `tesla_nightly_lock_status`, and the
+`NIGHTLY_LOCK_*` settings.
 
 At `NIGHTLY_LOCK_TIME` in `NIGHTLY_LOCK_TIMEZONE` (default 22:00 America/New_York, correct across daylight saving
 changes), a Durable Object alarm sends the signed lock. If the car is asleep or offline it is woken, polled until
@@ -105,9 +121,15 @@ from it). Node 22 or newer.
 
 7. **Get a refresh token for your account.** Browser sign-in is not built yet. Complete Tesla's OAuth
    authorization-code flow once (for example with Tesla's documented flow or a tool you trust), then store the
-   refresh token with `wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. It seeds the encrypted token store once;
-   Tesla rotates refresh tokens, and the Worker keeps the newest. If Tesla later rejects it, the server reports
-   `reauth_required` and stops retrying until you set a new bootstrap token.
+   refresh token with `wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. It seeds the encrypted token store;
+   Tesla rotates refresh tokens, and the Worker keeps the newest. Do not share that refresh token with another
+   Tesla tool: whichever one refreshes second is locked out.
+
+   **Signing in again (`reauth_required`).** If Tesla rejects the stored sign-in (a revoked or expired refresh
+   token), every tool fails with `reauth_required`, a code-only error is logged, and no further refreshes are tried.
+   One step fixes it: get a new refresh token and run `npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`. Any
+   value that has not been seeded before replaces the stored tokens on the next request; setting the same value
+   again does nothing.
 
 8. **Pair the virtual key with the car.** On the phone with the Tesla app, open `https://tesla.com/_ak/<your-domain>`
    and approve the key. Signed commands fail with "pairing required" until this is done.
