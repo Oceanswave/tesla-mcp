@@ -35,6 +35,9 @@ export default defineConfig({
           TESLA_CLIENT_SECRET: "",
           TESLA_BOOTSTRAP_REFRESH_TOKEN: `test-bootstrap-${randomToken(24)}`,
           TESLA_VEHICLE_ID: "",
+          // Production enables dangerous commands in wrangler.jsonc; tests pin the
+          // safe default so the gate stays covered.
+          DANGEROUS_COMMANDS_ENABLED: "false",
         },
       },
     }),
