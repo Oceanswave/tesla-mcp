@@ -14,10 +14,13 @@ and of the lock retry logic matters more than speed.
   "your ... URL" mention in the README self-host section.
 - TypeScript strict, ESM. npm with a committed `package-lock.json`; pin exact dependency versions. Biome for lint
   and format.
-- New vehicle commands: add them to `SIGNED_COMMANDS` in `src/tesla/vcp/protocol.ts` with test vectors, and extend
-  `test/vectors/vcsec-lock.json` (or a sibling file) plus `conformance/go/` so Tesla's Go code checks them. Anything
-  that unlocks, opens, starts, or weakens security must declare a `dangerousAction` (see `src/mcp/dangerous.ts`)
-  so it stays unregistered unless `DANGEROUS_COMMANDS_ENABLED` is `"true"`.
+- New vehicle commands: add a payload builder to `src/tesla/vcp/payloads.ts` (it lands in `SIGNED_COMMANDS` in
+  `src/tesla/vcp/protocol.ts`), a vector to `test/vectors/vcp-commands.json`, and the matching Tesla method call to
+  `teslaCalls` in `conformance/go/tesla_mcp_commands_test.go`; take the expected bytes from Tesla's code, never from
+  ours. New REST calls go in `src/tesla/endpoints.ts`, and every tool is a spec in `src/mcp/catalog.ts`. Anything
+  that unlocks, opens, starts, or weakens security must declare a `dangerousAction` (see `src/mcp/dangerous.ts`),
+  both on the tool and in `dangerousSignedCommand` or the endpoint, so it stays unregistered and unsent unless
+  `DANGEROUS_COMMANDS_ENABLED` is `"true"`.
 - No schedules, routines, alarms, or cron triggers in the Worker, and no owner-specific callers in this repo: a
   routine (such as a nightly lock) runs in the caller and calls the MCP tools.
 - Every state-changing tool requires `confirm: true` and supports `dryRun: true` (via `commandGate` in
@@ -30,16 +33,21 @@ and of the lock retry logic matters more than speed.
   any other export from the entry module).
 - `src/routes.ts`: routes, security headers, `/mcp` transport.
 - `src/auth.ts`: `McpAuthenticator` interface and the bearer-token implementation.
-- `src/mcp/`: tool definitions and the dangerous-command gate.
+- `src/mcp/`: core tool definitions and the confirm gate (`server.ts`), the declarative catalog of every other tool
+  (`catalog.ts`), and the dangerous-command gate.
 - `src/owner/`: `OwnerState` Durable Object (encrypted tokens, sign-in state, audit log, command lane), the lock
   retry policy, token encryption.
-- `src/tesla/`: Fleet REST client, bounded HTTP helpers, and `vcp/` (Vehicle Command Protocol codec, crypto, and
-  the per-VIN `TeslaVcpSession` Durable Object).
+- `src/tesla/`: Fleet REST client, the REST endpoint allowlist (`endpoints.ts`), bounded HTTP helpers, and `vcp/`
+  (protobuf wire codec, command payload builders, envelope and crypto, and the per-VIN `TeslaVcpSession` Durable
+  Object).
 - `test/`: Workers-runtime tests with a simulated Tesla in `test/helpers/fake-tesla.ts`.
-- `conformance/`: a Go test compiled inside a pinned checkout of Tesla's `vehicle-command` (its signer is in
-  `internal/`) that rebuilds `test/vectors/vcsec-lock.json` with Tesla's code.
+- `conformance/`: Go tests compiled inside a pinned checkout of Tesla's `vehicle-command`: one in
+  `internal/authentication` rebuilds the envelope vectors (`vcsec-lock.json`, `infotainment-honk.json`) with Tesla's
+  signer, one in `pkg/vehicle` checks every payload in `vcp-commands.json` against Tesla's own command methods.
 
 ## Checks
 
-Run `npm run check` (typecheck, lint, test), `npm run deploy:dry`, and `bash conformance/run.sh` before finishing. Regenerate VCSEC vectors
+Run `npm run check` (typecheck, lint, test), `npm run deploy:dry`, and `bash conformance/run.sh` before finishing
+(without a local Go: `docker run --rm -v "$PWD":/repo:ro -w /repo golang:1.27.3 bash conformance/run.sh`).
+`GAP.md` maps Tesla's API to tools; keep it current when tools change. Regenerate VCSEC vectors
 with `scripts/vcsec_vectors.py` if the signer's encoding changes on purpose.
