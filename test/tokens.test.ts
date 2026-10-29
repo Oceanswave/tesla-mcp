@@ -124,6 +124,57 @@ describe("OwnerState Tesla tokens", () => {
     expect(tesla.tokenRequests).toHaveLength(1);
   });
 
+  it("signs in again after reauth_required once a new bootstrap token is set", async () => {
+    const tesla = new FakeTesla();
+    tesla.tokenResponder = () => Response.json({ error: "invalid_grant" }, { status: 400 });
+    tesla.install();
+    const stub = ownerStub();
+    expect(await stub.listVehicles()).toMatchObject({ ok: false, error: { code: "reauth_required" } });
+    const failed = await stub.listVehicles();
+    expect(failed.ok ? "" : failed.error.message).toMatch(/wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN/);
+
+    // The owner sets a new value: the very next request uses it.
+    const healthy = new FakeTesla();
+    vi.restoreAllMocks();
+    healthy.install();
+    await runInDurableObject(stub, async (instance: OwnerState) => {
+      Object.assign(instance, { env: { ...env, TESLA_BOOTSTRAP_REFRESH_TOKEN: "new-refresh-token-after-reauth" } });
+      await instance.getAccessToken();
+    });
+    expect(healthy.tokenRequests[0]?.get("refresh_token")).toBe("new-refresh-token-after-reauth");
+    expect((await stub.nightlyLockStatus()).authState).toBe("ok");
+    const audit = await stub.auditRecent(10);
+    expect(audit.find((row) => row.action === "tokens_seeded")?.detail).toBe("replaced rejected refresh token");
+  });
+
+  it("replaces stored tokens with a new bootstrap token even without a recorded reauth", async () => {
+    // A Fleet 401 that survives a forced refresh reports reauth_required
+    // without Tesla's sign-in service ever rejecting the refresh token.
+    const tesla = new FakeTesla();
+    tesla.fleetOverrides = [
+      { path: /^\/api\/1\/vehicles$/, status: 401 },
+      { path: /^\/api\/1\/vehicles$/, status: 401 },
+    ];
+    tesla.install();
+    const stub = ownerStub();
+    expect(await stub.listVehicles()).toMatchObject({ ok: false, error: { code: "reauth_required" } });
+
+    await runInDurableObject(stub, async (instance: OwnerState, state) => {
+      // The same value as before is never seeded again.
+      await instance.getAccessToken(true);
+      expect(tesla.tokenRequests.at(-1)?.get("refresh_token")).toBe(tesla.issuedRefreshTokens.at(-2));
+
+      Object.assign(instance, { env: { ...env, TESLA_BOOTSTRAP_REFRESH_TOKEN: "replacement-refresh-token" } });
+      await instance.getAccessToken();
+      expect(tesla.tokenRequests.at(-1)?.get("refresh_token")).toBe("replacement-refresh-token");
+      const stored = await decryptTokens(await importTokenKey(env.TOKEN_ENCRYPTION_KEY), storedBlob(state) as string);
+      expect(stored.refreshToken).toBe(tesla.issuedRefreshTokens.at(-1));
+    });
+    expect(await stub.listVehicles()).toMatchObject({ ok: true });
+    const seeded = (await stub.auditRecent(20)).filter((row) => row.action === "tokens_seeded");
+    expect(seeded.map((row) => row.detail)).toEqual(["replaced stored tokens", "initial seed"]);
+  });
+
   it("forces exactly one refresh and one retry on a Fleet 401", async () => {
     const tesla = new FakeTesla();
     tesla.fleetOverrides = [{ path: /^\/api\/1\/vehicles$/, status: 401 }];

@@ -39,6 +39,11 @@ const MISSED_WINDOW_MS = 3 * 60 * 60_000;
  * spam the car. */
 const MAX_NIGHTLY_RUNS = 4;
 
+/** The one-step fix for a rejected Tesla sign-in, shown to callers. */
+const REAUTH_MESSAGE =
+  "Tesla sign-in has expired or was revoked. Get a new Tesla refresh token and set it with " +
+  "`npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN`; the next request uses it.";
+
 /** Durable record of the current night's run. "pending" is written before
  * any Tesla call and "done" only after the outcome is recorded, so a retried
  * alarm resumes an interrupted run and never repeats a finished one. */
@@ -215,27 +220,24 @@ export class OwnerState extends DurableObject<Env> {
     }
   }
 
-  /** Load stored tokens, seeding from TESLA_BOOTSTRAP_REFRESH_TOKEN only when
-   * nothing is stored yet, or when Tesla rejected the stored refresh token and
-   * the owner has since provided a different bootstrap token. Runs only inside
-   * the token flight (see getAccessToken). */
+  /** Load stored tokens. A TESLA_BOOTSTRAP_REFRESH_TOKEN value that has not
+   * been seeded before replaces whatever is stored, whatever the auth state:
+   * setting a new value is how the owner signs in again. The same value is
+   * never seeded twice, so the rotated tokens Tesla issues are kept. Runs only
+   * inside the token flight (see getAccessToken). */
   private async loadTokens(): Promise<StoredTokens> {
     const key = await this.tokenKey();
     const blob = this.kvGet("tokens");
     const bootstrap = this.env.TESLA_BOOTSTRAP_REFRESH_TOKEN?.trim();
     const reauth = this.kvGet("auth_state") === "reauth_required";
-    if (bootstrap && (!blob || reauth)) {
+    if (bootstrap) {
       const seed = await fingerprint(bootstrap);
       if (this.kvGet("seed_fingerprint") !== seed) {
         const seeded: StoredTokens = { accessToken: null, refreshToken: bootstrap, expiresAt: 0 };
         const encrypted = await encryptTokens(key, seeded);
-        // Compare-and-set: write only over exactly the state read above, so a
-        // seed can never replace tokens rotated in the meantime.
-        if (
-          this.kvGet("tokens") !== blob ||
-          this.kvGet("seed_fingerprint") === seed ||
-          (this.kvGet("auth_state") === "reauth_required") !== reauth
-        ) {
+        // Compare-and-set across the await above: if another flight changed
+        // the token state meanwhile, start over from what is stored now.
+        if (this.kvGet("tokens") !== blob || this.kvGet("seed_fingerprint") === seed) {
           return this.loadTokens();
         }
         this.kvSet("tokens", encrypted);
@@ -246,17 +248,12 @@ export class OwnerState extends DurableObject<Env> {
           action: "tokens_seeded",
           vehicleId: null,
           outcome: "ok",
-          detail: reauth ? "replaced rejected refresh token" : "initial seed",
+          detail: !blob ? "initial seed" : reauth ? "replaced rejected refresh token" : "replaced stored tokens",
         });
         return seeded;
       }
     }
-    if (reauth) {
-      throw new OwnerError(
-        "reauth_required",
-        "Tesla sign-in has expired. The owner needs to provide a new refresh token.",
-      );
-    }
+    if (reauth) throw new OwnerError("reauth_required", REAUTH_MESSAGE);
     if (!blob) throw new OwnerError("not_configured", "No Tesla account is connected yet.");
     try {
       return await decryptTokens(key, blob);
@@ -351,10 +348,8 @@ export class OwnerState extends DurableObject<Env> {
         outcome: "error",
         detail: `reauth_required ${response.status} ${errorCode.slice(0, 32)}`,
       });
-      throw new OwnerError(
-        "reauth_required",
-        "Tesla sign-in has expired. The owner needs to provide a new refresh token.",
-      );
+      console.error(`[tesla-mcp] reauth_required: Tesla rejected the refresh token (http ${response.status})`);
+      throw new OwnerError("reauth_required", REAUTH_MESSAGE);
     }
     const accessToken = body.access_token;
     if (response.status !== 200 || typeof accessToken !== "string" || !accessToken) {
@@ -396,7 +391,8 @@ export class OwnerState extends DurableObject<Env> {
       return await call(await this.getAccessToken(true));
     } catch (error) {
       if (error instanceof FleetError && error.code === "unauthorized") {
-        throw new OwnerError("reauth_required", "Tesla rejected the account token. The owner needs to sign in again.");
+        console.error("[tesla-mcp] reauth_required: Fleet API rejected a freshly refreshed token");
+        throw new OwnerError("reauth_required", REAUTH_MESSAGE);
       }
       throw error;
     }
