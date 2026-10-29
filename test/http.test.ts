@@ -1,7 +1,7 @@
 import { SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { handleRequest, MAX_MCP_BODY_BYTES, PUBLIC_KEY_PATH } from "../src/index";
+import { handleRequest, MAX_MCP_BODY_BYTES, PUBLIC_KEY_PATH } from "../src/routes";
 
 const BASE = "https://tesla-mcp.example";
 const INIT = JSON.stringify({

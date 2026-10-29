@@ -3,9 +3,9 @@ import { env } from "cloudflare:workers";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { McpAuthenticator } from "../src/auth";
-import { handleRequest } from "../src/index";
 import { DANGEROUS_ACTIONS, type DangerousAction, gateTools } from "../src/mcp/dangerous";
 import type { OwnerState } from "../src/owner/state";
+import { handleRequest } from "../src/routes";
 import { FakeTesla, uniqueName } from "./helpers/fake-tesla";
 
 const ENDPOINT = "https://tesla-mcp.example/mcp";
