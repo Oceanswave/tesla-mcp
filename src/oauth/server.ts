@@ -58,7 +58,7 @@ export function authorizationServer(url: URL, env: Env): OAuthAuthorizationServe
       const rejected = Array.isArray(clientMetadata.redirect_uris)
         ? clientMetadata.redirect_uris.slice(0, 10).map((u) => String(u).slice(0, 300))
         : [];
-      console.warn();
+      console.warn(`[tesla-mcp] register rejected redirect_uris ${JSON.stringify(rejected)}`);
       return {
         code: "invalid_redirect_uri",
         description:
