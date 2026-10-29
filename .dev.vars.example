@@ -20,9 +20,14 @@ TESLA_COMMAND_PRIVATE_KEY_PKCS8_B64=replace-with-base64-pkcs8-der
 # Generate: openssl rand -base64 32
 TOKEN_ENCRYPTION_KEY=replace-with-base64-32-bytes
 
-# A Tesla refresh token for your account. Seeded into the encrypted token
-# store once per distinct value: setting a new value is how you sign in again
-# after reauth_required. The same value is never seeded twice.
+# Optional: the redirect URI registered in your Tesla developer app, used by
+# /login and /callback. If unset, it is this server's origin + /callback.
+TESLA_REDIRECT_URI=
+
+# Optional: a Tesla refresh token for your account, as an alternative to
+# signing in at /login. Seeded into the encrypted token store once per distinct
+# value: setting a new value also signs in again after reauth_required. The
+# same value is never seeded twice, and a browser sign-in supersedes it.
 TESLA_BOOTSTRAP_REFRESH_TOKEN=replace-with-a-refresh-token
 
 # Optional: the Fleet vehicle id to target. If unset and the account has one
