@@ -39,7 +39,7 @@
     "OAUTH_REDIRECT_BASE": "https://tesla-mcp.sean-1b3.workers.dev",
     // The car tools use when called without vehicle_id: a VIN or Fleet vehicle
     // id. Empty: the account's only car (more than one car needs vehicle_id).
-    "DEFAULT_VIN": "3744575790395509",
+    "DEFAULT_VIN": "7G2CEHED3RA011124",
     // Extra OAuth redirect URIs, comma separated, beyond the built-in Claude
     // callbacks and http://localhost / http://127.0.0.1 on any port.
     "OAUTH_EXTRA_REDIRECT_URIS": ""
