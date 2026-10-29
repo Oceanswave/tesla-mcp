@@ -196,34 +196,20 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
         }),
     },
     {
-      name: "tesla_nightly_lock_status",
+      name: "tesla_auth_status",
       description:
-        "Deprecated: will be removed with the built-in nightly lock. Report the built-in nightly lock: whether it is on, the local time and time zone it runs, when it runs next, how the last run went, and whether Tesla sign-in needs renewing.",
+        "Report whether the server's Tesla sign-in works: authState is ok, reauth_required (Tesla rejected the sign-in; the owner must set a new refresh token), or not_configured. Reads stored state only; never contacts Tesla or wakes the car.",
       inputSchema: z.object({}).strict(),
       annotations: { ...READ, openWorldHint: false },
       handler: async () => {
-        const status = await owner.nightlyLockStatus();
-        let summary: string;
-        if (!status.enabled) {
-          summary = status.configError
-            ? `The nightly lock is off because of a configuration problem: ${status.configError}.`
-            : "The nightly lock is turned off.";
-        } else {
-          summary = status.nextRun
-            ? `The nightly lock is on for ${status.time} ${status.timeZone}. Next run ${status.nextRun.local}.`
-            : `The nightly lock is on for ${status.time} ${status.timeZone}, but no alarm is armed yet. The cron trigger arms it within 15 minutes.`;
-          if (status.lastRun) {
-            summary += ` Last run on ${status.lastRun.localDate}: ${status.lastRun.outcome === "ok" ? "succeeded" : "failed"} (${status.lastRun.detail}).`;
-          }
-        }
-        if (status.authState === "reauth_required") summary += " Tesla sign-in needs to be renewed.";
-        return result({ summary, ...status });
+        const status = await owner.authStatus();
+        return result({ summary: status.message ?? "Tesla sign-in is working.", ...status });
       },
     },
     {
       name: "tesla_audit_recent",
       description:
-        "Show the most recent entries in the audit log of commands, wakes, nightly lock runs, and sign-in events, newest first.",
+        "Show the most recent entries in the audit log of commands, wakes, and sign-in events, newest first.",
       inputSchema: z
         .object({
           limit: z.number().int().min(1).max(100).optional().describe("How many entries, 1 to 100. Default 20."),

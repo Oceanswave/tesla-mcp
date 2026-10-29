@@ -26,17 +26,14 @@ export type LockPolicy = {
   budgetMs: number;
 };
 
-// One policy for every lock. Seven minutes also fits a Durable Object alarm,
-// which is cut off after 15 minutes of wall time: it leaves room for one more
-// signed command already in flight (handshake and command retries can take
-// about five minutes when every Tesla call times out) plus the lock-state
-// check after it.
+// One policy for every lock, whoever calls it. Seven minutes bounds a single
+// tool call: a caller that waits on tesla_lock (a person, an assistant, or a
+// scheduled routine) gets an answer, and one more signed command already in
+// flight (handshake and command retries can take about five minutes when every
+// Tesla call times out) plus the lock-state check after it can still finish.
 export const LOCK_POLICY: LockPolicy = { maxAttempts: 4, wakeTimeoutMs: 90_000, budgetMs: 7 * 60_000 };
 
 export type LockOptions = {
-  /** Check vehicle_state.locked before sending: a resumed run may already
-   * have locked the car before it was interrupted. */
-  checkLockedFirst?: boolean;
   /** After Tesla accepts the lock, read vehicle_state.locked back. A car that
    * still reports unlocked gets another attempt. */
   confirmLocked?: boolean;
@@ -124,22 +121,16 @@ export async function lockWithRetry(
 ): Promise<LockOutcome> {
   const deadline = deps.now() + policy.budgetMs;
   let woke = false;
-  let online = true;
   let lastCode: LockFailureCode = "vehicle_unavailable";
   let lastDetail = "not_attempted";
 
   if ((await deps.getState()) !== "online") {
     woke = true;
-    online = await wakeAndWait(deps, policy.wakeTimeoutMs, deadline);
-    if (!online) {
+    if (!(await wakeAndWait(deps, policy.wakeTimeoutMs, deadline))) {
       lastCode = "wake_timeout";
       lastDetail = "vehicle did not come online after wake";
     }
   }
-  if (options.checkLockedFirst && online && (await deps.isLocked()) === true) {
-    return { ok: true, detail: "already_locked", attempts: 0, woke, confirmed: true };
-  }
-
   // The first attempt always runs; later ones only start within the budget.
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt++) {
     if (attempt > 1 && deps.now() >= deadline) {

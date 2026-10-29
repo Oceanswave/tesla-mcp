@@ -148,8 +148,8 @@ describe("lockWithRetry", () => {
   });
 
   it("stops starting new work once the time budget is spent, counting Tesla's latency", async () => {
-    // Every call takes 60 s: sleeps alone would allow far more than the
-    // Durable Object alarm's 15-minute limit.
+    // Every call takes 60 s: sleeps alone would let one tool call run far
+    // longer than the seven-minute budget.
     const { d, calls } = deps({ states: ["asleep"], locks: [], latencyMs: 60_000 });
     const outcome = await lockWithRetry(d, LOCK_POLICY);
     expect(outcome).toMatchObject({ ok: false, woke: true });
@@ -157,28 +157,6 @@ describe("lockWithRetry", () => {
     // Nothing starts after the budget; at most the call in flight finishes.
     expect(calls.clock).toBeLessThanOrEqual(LOCK_POLICY.budgetMs + 2 * 60_000);
     expect(calls.lock).toBeLessThan(LOCK_POLICY.maxAttempts);
-  });
-
-  it("checks the lock state first when asked and sends nothing if already locked", async () => {
-    const { d, calls } = deps({ states: ["online"], locks: [ok], locked: true });
-    expect(await lockWithRetry(d, LOCK_POLICY, { checkLockedFirst: true })).toEqual({
-      ok: true,
-      detail: "already_locked",
-      attempts: 0,
-      woke: false,
-      confirmed: true,
-    });
-    expect(calls.lock).toBe(0);
-  });
-
-  it("still locks when the first check finds the car unlocked", async () => {
-    const { d, calls } = deps({ states: ["online"], locks: [ok], locked: false });
-    expect(await lockWithRetry(d, LOCK_POLICY, { checkLockedFirst: true })).toMatchObject({
-      ok: true,
-      detail: "locked",
-      attempts: 1,
-    });
-    expect(calls.lock).toBe(1);
   });
 
   it("reads the lock state back when asked and reports it confirmed", async () => {

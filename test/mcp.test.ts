@@ -34,8 +34,8 @@ type ToolResult = { isError?: boolean; structuredContent?: Record<string, unknow
 
 const EXPECTED_TOOLS = [
   "tesla_audit_recent",
+  "tesla_auth_status",
   "tesla_lock",
-  "tesla_nightly_lock_status",
   "tesla_vehicle_status",
   "tesla_vehicles_list",
   "tesla_wake",
@@ -174,11 +174,30 @@ describe("MCP over the real /mcp handler", () => {
     await client.close();
   });
 
-  it("reports the nightly lock schedule", async () => {
+  it("reports the sign-in state without contacting Tesla", async () => {
+    const tesla = new FakeTesla();
+    tesla.install();
     const { client } = await connect();
-    const result = (await client.callTool({ name: "tesla_nightly_lock_status", arguments: {} })) as ToolResult;
-    expect(result.structuredContent).toMatchObject({ enabled: true, time: "22:00", timeZone: "America/New_York" });
-    expect(String(result.structuredContent?.summary)).toMatch(/22:00 America\/New_York/);
+    // Nothing has signed in yet, but a bootstrap token is ready to use.
+    const ready = (await client.callTool({ name: "tesla_auth_status", arguments: {} })) as ToolResult;
+    expect(ready.structuredContent).toMatchObject({ authState: "ok", message: null });
+    expect(tesla.requests).toHaveLength(0);
+    await client.close();
+  });
+
+  it("reports reauth_required once Tesla rejects the sign-in", async () => {
+    const tesla = new FakeTesla();
+    tesla.tokenResponder = () => Response.json({ error: "invalid_grant" }, { status: 400 });
+    tesla.install();
+    const { client } = await connect();
+    const listed = (await client.callTool({ name: "tesla_vehicles_list", arguments: {} })) as ToolResult;
+    expect(listed.structuredContent).toMatchObject({ error: "reauth_required" });
+    const requests = tesla.requests.length;
+    const status = (await client.callTool({ name: "tesla_auth_status", arguments: {} })) as ToolResult;
+    expect(status.isError).toBeUndefined();
+    expect(status.structuredContent).toMatchObject({ authState: "reauth_required" });
+    expect(String(status.structuredContent?.summary)).toMatch(/wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN/);
+    expect(tesla.requests).toHaveLength(requests);
     await client.close();
   });
 });

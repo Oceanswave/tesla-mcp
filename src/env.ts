@@ -11,11 +11,6 @@ export interface Env {
   TESLA_FLEET_BASE_URL: string;
   TESLA_AUTH_TOKEN_URL: string;
   TESLA_PUBLIC_KEY_PEM: string;
-  /** Deprecated built-in nightly lock: "true" keeps it on. Removed, with
-   * its time and zone, once the outside caller has taken over. */
-  NIGHTLY_LOCK_ENABLED: string;
-  NIGHTLY_LOCK_TIME: string;
-  NIGHTLY_LOCK_TIMEZONE: string;
   DANGEROUS_COMMANDS_ENABLED: string;
 
   MCP_BEARER_TOKEN?: string;

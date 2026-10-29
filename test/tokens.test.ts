@@ -113,7 +113,7 @@ describe("OwnerState Tesla tokens", () => {
       await expect(instance.getAccessToken(true)).rejects.toThrow(/sign-in has expired/);
     });
     expect(tesla.tokenRequests).toHaveLength(1);
-    const status = await stub.nightlyLockStatus();
+    const status = await stub.authStatus();
     expect(status.authState).toBe("reauth_required");
     const audit = await stub.auditRecent(10);
     expect(audit.some((row) => row.action === "token_refresh" && row.detail.startsWith("reauth_required"))).toBe(true);
@@ -142,9 +142,29 @@ describe("OwnerState Tesla tokens", () => {
       await instance.getAccessToken();
     });
     expect(healthy.tokenRequests[0]?.get("refresh_token")).toBe("new-refresh-token-after-reauth");
-    expect((await stub.nightlyLockStatus()).authState).toBe("ok");
+    expect((await stub.authStatus()).authState).toBe("ok");
     const audit = await stub.auditRecent(10);
     expect(audit.find((row) => row.action === "tokens_seeded")?.detail).toBe("replaced rejected refresh token");
+  });
+
+  it("reports the sign-in state from storage alone", async () => {
+    const tesla = new FakeTesla();
+    tesla.tokenResponder = () => Response.json({ error: "invalid_grant" }, { status: 400 });
+    tesla.install();
+    const stub = ownerStub();
+    await runInDurableObject(stub, async (instance: OwnerState) => {
+      Object.assign(instance, { env: { ...env, TESLA_BOOTSTRAP_REFRESH_TOKEN: "" } });
+      expect(await instance.authStatus()).toMatchObject({ authState: "not_configured" });
+      Object.assign(instance, { env });
+      // A bootstrap token not yet tried counts as ok: the next request uses it.
+      expect(await instance.authStatus()).toEqual({ authState: "ok", message: null });
+      await expect(instance.getAccessToken()).rejects.toThrow(/sign-in has expired/);
+      expect(await instance.authStatus()).toMatchObject({ authState: "reauth_required" });
+      // Setting a new value is reported as ok before any request uses it.
+      Object.assign(instance, { env: { ...env, TESLA_BOOTSTRAP_REFRESH_TOKEN: "another-refresh-token" } });
+      expect((await instance.authStatus()).authState).toBe("ok");
+    });
+    expect(tesla.tokenRequests).toHaveLength(1);
   });
 
   it("replaces stored tokens with a new bootstrap token even without a recorded reauth", async () => {
