@@ -42,6 +42,6 @@
     "DEFAULT_VIN": "7G2CEHED3RA011124",
     // Extra OAuth redirect URIs, comma separated, beyond the built-in Claude
     // callbacks and http://localhost / http://127.0.0.1 on any port.
-    "OAUTH_EXTRA_REDIRECT_URIS": ""
+    "OAUTH_EXTRA_REDIRECT_URIS": "https://www.cursor.com/agents/mcp/oauth/callback"
   }
 }
