@@ -41,10 +41,10 @@ const COMMAND_SCOPES: ScopeRequirement = { anyOf: ["vehicle_cmds"] };
 
 const vehicleId = z
   .string()
-  .regex(/^\d{1,20}$/)
+  .regex(/^(?:\d{1,20}|[A-HJ-NPR-Za-hj-npr-z0-9]{17})$/)
   .optional()
   .describe(
-    "Tesla vehicle id from tesla_vehicles_list. Leave out when the account has one car or a default car is configured.",
+    "The car's id or VIN from tesla_vehicles_list. Leave out to use the default car (DEFAULT_VIN) or the account's only car.",
   );
 const confirm = z
   .boolean()
@@ -89,7 +89,9 @@ async function commandGate(
   describe: string,
   run: () => Promise<CallToolResult>,
 ): Promise<CallToolResult> {
-  const vehicle = typeof input.vehicle_id === "string" ? input.vehicle_id : null;
+  const requested = typeof input.vehicle_id === "string" ? input.vehicle_id : null;
+  // The audit log keeps Fleet ids only; a VIN stays out of it.
+  const vehicle = requested && /^\d+$/.test(requested) ? requested : null;
   if (input.confirm !== true) {
     await owner.recordAudit({
       source: "tool",
@@ -112,7 +114,7 @@ async function commandGate(
       summary: `Dry run: this would ${describe}. Nothing was sent to Tesla.`,
       dryRun: true,
       action,
-      vehicleId: vehicle ?? "default",
+      vehicleId: requested ?? "default",
       ...(typeof input.energy_site_id === "string" ? { energySiteId: input.energy_site_id } : {}),
     });
   }
@@ -205,7 +207,7 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
     {
       name: "tesla_vehicles_list",
       description:
-        "List the cars on the owner's Tesla account with their id, name, and whether each is online, asleep, or offline. Does not wake any car. Tesla scope: vehicle_device_data.",
+        "List the cars on the owner's Tesla account with their id, VIN, name, and whether each is online, asleep, or offline. Does not wake any car. Tesla scope: vehicle_device_data.",
       inputSchema: z.object({}).strict(),
       annotations: READ,
       scopes: READ_SCOPES,
@@ -214,6 +216,7 @@ export function toolDefinitions(owner: OwnerStub): ToolDefinition[] {
         if (!listed.ok) return failure(listed.error);
         const vehicles = listed.data.map((vehicle) => ({
           id: vehicle.id,
+          vin: vehicle.vin,
           name: vehicle.displayName,
           state: vehicle.state,
         }));

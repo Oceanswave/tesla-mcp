@@ -41,7 +41,9 @@ describe("MCP over the real /mcp handler", () => {
 
     const listed = (await client.callTool({ name: "tesla_vehicles_list", arguments: {} })) as ToolResult;
     expect(listed.isError).toBeFalsy();
-    expect(listed.structuredContent?.vehicles).toEqual([{ id: tesla.vehicleId, name: "Test Car", state: "online" }]);
+    expect(listed.structuredContent?.vehicles).toEqual([
+      { id: tesla.vehicleId, vin: tesla.vin, name: "Test Car", state: "online" },
+    ]);
 
     const status = (await client.callTool({ name: "tesla_vehicle_status", arguments: {} })) as ToolResult;
     expect(status.structuredContent).toMatchObject({

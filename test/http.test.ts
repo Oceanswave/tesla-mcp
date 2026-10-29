@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { createExecutionContext, SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { handleRequest, MAX_MCP_BODY_BYTES, PUBLIC_KEY_PATH } from "../src/routes";
@@ -77,12 +77,17 @@ describe("/mcp authentication", () => {
 
   it("fails closed when MCP_BEARER_TOKEN is unset", async () => {
     for (const token of [undefined, ""]) {
-      const response = await handleRequest(mcpRequest(`Bearer ${env.MCP_BEARER_TOKEN}`), {
-        ...env,
-        MCP_BEARER_TOKEN: token,
-      });
+      const response = await handleRequest(
+        mcpRequest(`Bearer ${env.MCP_BEARER_TOKEN}`),
+        { ...env, MCP_BEARER_TOKEN: token },
+        createExecutionContext(),
+      );
       expect(response.status).toBe(401);
-      const empty = await handleRequest(mcpRequest("Bearer "), { ...env, MCP_BEARER_TOKEN: token });
+      const empty = await handleRequest(
+        mcpRequest("Bearer "),
+        { ...env, MCP_BEARER_TOKEN: token },
+        createExecutionContext(),
+      );
       expect(empty.status).toBe(401);
     }
   });

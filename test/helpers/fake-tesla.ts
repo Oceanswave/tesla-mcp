@@ -446,6 +446,8 @@ export class FakeTesla {
   commandResult: { result: boolean; reason: string } = { result: true, reason: "" };
   issuedAccessTokens: string[] = [];
   issuedRefreshTokens: string[] = [];
+  /** More cars on the account, listed after this one (list only). */
+  otherVehicles: { id_s: string; vin: string; display_name: string; state: string }[] = [];
   /** Fleet REST responses consumed before normal handling (e.g. a 401). */
   fleetOverrides: { path: RegExp; status: number }[] = [];
   tokenResponder: Responder;
@@ -588,7 +590,8 @@ export class FakeTesla {
     }
     const base = `/api/1/vehicles/${this.vehicleId}`;
     if (request.method === "GET" && url.pathname === "/api/1/vehicles") {
-      return Response.json({ response: [this.vehicleJson()], count: 1 });
+      const vehicles = [this.vehicleJson(), ...this.otherVehicles];
+      return Response.json({ response: vehicles, count: vehicles.length });
     }
     if (request.method === "GET" && url.pathname === base) {
       if (this.pollsSinceWake !== null && this.state !== "online") {

@@ -32,7 +32,10 @@ and of the lock retry logic matters more than speed.
 - `src/index.ts`: the Worker entry: the fetch handler and the Durable Object classes only (workerd refuses
   any other export from the entry module).
 - `src/routes.ts`: routes, security headers, `/mcp` transport.
-- `src/auth.ts`: `McpAuthenticator` interface and the bearer-token implementation.
+- `src/auth.ts`: `McpAuthenticator` interface; the default accepts the static bearer token or an OAuth access token.
+- `src/oauth/`: the OAuth front door for `/mcp` on `@cloudflare/workers-oauth-provider` (discovery, `/token`,
+  `/register`, token validation), the passphrase-gated `/authorize` page, `/admin/clients`, and the redirect URI
+  allowlist. Storage is the `OAUTH_KV` namespace.
 - `src/mcp/`: core tool definitions and the confirm gate (`server.ts`), the declarative catalog of every other tool
   (`catalog.ts`), and the dangerous-command gate.
 - `src/owner/`: `OwnerState` Durable Object (encrypted tokens, sign-in state, audit log, command lane), the lock

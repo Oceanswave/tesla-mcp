@@ -99,6 +99,12 @@ export type EndpointSuccess = { data: unknown; vehicleId?: string; energySiteId?
 
 export type OwnerResult<T> = { ok: true; data: T } | { ok: false; error: OwnerFailure };
 
+/** The audit log records Fleet vehicle ids only: a VIN a caller passed is
+ * left out until it resolves to an id. */
+function auditableVehicleId(value: string | undefined): string | null {
+  return value && ID_PATTERN.test(value) ? value : null;
+}
+
 class OwnerError extends Error {
   constructor(
     readonly code: OwnerErrorCode,
@@ -476,21 +482,46 @@ export class OwnerState extends DurableObject<Env> {
     return vehicles;
   }
 
+  /** An explicit vehicle (id or VIN) wins; then DEFAULT_VIN (also an id or
+   * VIN); then the account's only vehicle. Every choice must be on the
+   * account, and an ambiguous request names the vehicles to choose from. */
   private async resolveVehicle(vehicleId: string | undefined): Promise<VehicleSummary> {
-    const requested = vehicleId ?? (this.env.TESLA_VEHICLE_ID?.trim() || undefined);
+    const explicit = vehicleId?.trim() || undefined;
+    const configured = this.env.DEFAULT_VIN?.trim() || undefined;
     const vehicles = await this.vehicles();
-    if (requested) {
-      const match = vehicles.find((vehicle) => vehicle.id === requested);
-      if (!match) throw new OwnerError("vehicle_not_found", "That vehicle is not on this Tesla account.");
+    const choices = () =>
+      vehicles
+        .map((vehicle) => `${vehicle.displayName ?? "unnamed"} (id ${vehicle.id}, VIN ${vehicle.vin})`)
+        .join(", ");
+    const find = (wanted: string) =>
+      vehicles.find((vehicle) => vehicle.id === wanted || vehicle.vin === wanted.toUpperCase());
+    if (explicit) {
+      const match = find(explicit);
+      if (!match) {
+        throw new OwnerError(
+          "vehicle_not_found",
+          `That vehicle is not on this Tesla account.${vehicles.length ? ` Vehicles: ${choices()}.` : ""}`,
+        );
+      }
+      return match;
+    }
+    if (configured) {
+      const match = find(configured);
+      if (!match) {
+        throw new OwnerError(
+          "vehicle_not_found",
+          `DEFAULT_VIN is set to ${configured}, which is not on this Tesla account.${
+            vehicles.length ? ` Vehicles: ${choices()}.` : ""
+          } Fix DEFAULT_VIN in wrangler.jsonc or pass vehicle_id.`,
+        );
+      }
       return match;
     }
     if (vehicles.length === 1) return vehicles[0] as VehicleSummary;
     if (!vehicles.length) throw new OwnerError("no_vehicles", "This Tesla account has no vehicles.");
     throw new OwnerError(
       "vehicle_id_required",
-      `This account has ${vehicles.length} vehicles. Say which one: ${vehicles
-        .map((vehicle) => `${vehicle.displayName ?? "unnamed"} (id ${vehicle.id})`)
-        .join(", ")}.`,
+      `This account has ${vehicles.length} vehicles and DEFAULT_VIN is not set. Pass vehicle_id (an id or VIN): ${choices()}.`,
     );
   }
 
@@ -562,7 +593,7 @@ export class OwnerState extends DurableObject<Env> {
 
   async vehicleStatus(vehicleId?: string): Promise<
     OwnerResult<{
-      vehicle: { id: string; displayName: string | null };
+      vehicle: { id: string; vin: string; displayName: string | null };
       state: string;
       status: ReturnType<typeof summarizeVehicleData> | null;
     }>
@@ -581,7 +612,14 @@ export class OwnerState extends DurableObject<Env> {
           state = "asleep";
         }
       }
-      return { ok: true, data: { vehicle: { id: vehicle.id, displayName: vehicle.displayName }, state, status } };
+      return {
+        ok: true,
+        data: {
+          vehicle: { id: vehicle.id, vin: vehicle.vin, displayName: vehicle.displayName },
+          state,
+          status,
+        },
+      };
     } catch (error) {
       return this.failure(error);
     }
@@ -589,7 +627,7 @@ export class OwnerState extends DurableObject<Env> {
 
   async wake(input: { vehicleId?: string }): Promise<OwnerResult<{ vehicleId: string; state: string }>> {
     return this.inLane(async () => {
-      let vehicleId: string | null = input.vehicleId ?? null;
+      let vehicleId: string | null = auditableVehicleId(input.vehicleId);
       try {
         const vehicle = await this.resolveVehicle(input.vehicleId);
         vehicleId = vehicle.id;
@@ -610,7 +648,7 @@ export class OwnerState extends DurableObject<Env> {
   }
 
   private async lockFlow(vehicleId: string | undefined): Promise<OwnerResult<LockSuccess>> {
-    let resolvedId: string | null = vehicleId ?? null;
+    let resolvedId: string | null = auditableVehicleId(vehicleId);
     try {
       const vehicle = await this.resolveVehicle(vehicleId);
       resolvedId = vehicle.id;
@@ -751,7 +789,7 @@ export class OwnerState extends DurableObject<Env> {
     const params = input.params ?? {};
     const scopes = endpointScopes(name, params);
     const run = async (): Promise<OwnerResult<EndpointSuccess>> => {
-      let vehicleId: string | null = input.vehicleId ?? null;
+      let vehicleId: string | null = auditableVehicleId(input.vehicleId);
       let energySiteId: string | null = input.energySiteId ?? null;
       try {
         this.refuseDangerous("dangerousAction" in endpoint ? endpoint.dangerousAction : undefined);
@@ -870,7 +908,7 @@ export class OwnerState extends DurableObject<Env> {
     }
     const params = input.params ?? {};
     return this.inLane(async () => {
-      let vehicleId: string | null = input.vehicleId ?? null;
+      let vehicleId: string | null = auditableVehicleId(input.vehicleId);
       try {
         this.refuseDangerous(dangerousSignedCommand(command, params));
         const vehicle = await this.resolveVehicle(input.vehicleId);

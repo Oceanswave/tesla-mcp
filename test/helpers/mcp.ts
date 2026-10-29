@@ -1,5 +1,6 @@
 // Connect an MCP client to the real /mcp handler as a fresh owner.
 
+import { createExecutionContext } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import type { McpAuthenticator } from "../../src/auth";
@@ -19,7 +20,8 @@ export async function connect(overrides: Partial<typeof env> = {}) {
   };
   const client = new Client({ name: "tesla-mcp-test", version: "1.0.0" });
   const transport = new StreamableHTTPClientTransport(new URL(ENDPOINT), {
-    fetch: (url, init) => handleRequest(new Request(url, init), { ...env, ...overrides }, authenticator),
+    fetch: (url, init) =>
+      handleRequest(new Request(url, init), { ...env, ...overrides }, createExecutionContext(), { authenticator }),
   });
   await client.connect(transport);
   const owner = env.OWNER.get(env.OWNER.idFromName(ownerId));

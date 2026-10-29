@@ -12,22 +12,24 @@ the rest), so they work on vehicles that require Tesla's command signing. The si
 for byte against Tesla's Go implementation: every command payload, both domains' handshakes and signatures, and the
 encrypted replies. [GAP.md](GAP.md) maps every Tesla capability to a tool, or says why there is none.
 
-**Status: owner-only MVP.** One owner, one static bearer token, one Tesla account. Multi-user sign-in with Tesla
-OAuth is planned; the auth and storage seams are already in place for it.
+**Status: owner-only MVP.** One owner, one Tesla account. `/mcp` accepts the static `MCP_BEARER_TOKEN` or an access
+token from the server's own OAuth front door, which the owner approves with a passphrase (see
+[Connecting MCP clients](#connecting-mcp-clients)).
 
 ## Tools
 
 126 tools. **101** are registered by default; the **25** marked dangerous exist only when
 `DANGEROUS_COMMANDS_ENABLED` is `"true"`. Every _command_ needs `confirm: true` and accepts `dryRun: true`; _read_
-tools take neither and never wake the car. Vehicle tools take an optional `vehicle_id` and energy tools an optional
-`energy_site_id` (left out, the account's only car or site is used). Each tool's description names the Tesla OAuth
+tools take neither and never wake the car. Vehicle tools take an optional `vehicle_id` (the car's id or VIN) and
+energy tools an optional `energy_site_id`. Left out, vehicle tools use `DEFAULT_VIN` if it is set, otherwise the
+account's only car; energy tools use the account's only site. Each tool's description names the Tesla OAuth
 scope it needs; see [Scopes](#scopes).
 
 ### Core
 
 | Tool                   | Kind    | What it does                                                                                                                                                                                                                                |
 | ---------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tesla_vehicles_list`  | read    | List the cars on the owner's Tesla account with their id, name, and whether each is online, asleep, or offline.                                                                                                                             |
+| `tesla_vehicles_list`  | read    | List the cars on the owner's Tesla account with their id, VIN, name, and whether each is online, asleep, or offline.                                                                                                                        |
 | `tesla_vehicle_status` | read    | Get the car's current status: online or asleep, and when online whether it is locked, which doors, trunks, or windows are open, battery percent, range, charging state, inside and outside temperature, climate, Sentry Mode, and odometer. |
 | `tesla_wake`           | command | Wake the car so it can report status or take commands.                                                                                                                                                                                      |
 | `tesla_lock`           | command | Lock the car's doors with a signed command.                                                                                                                                                                                                 |
@@ -214,8 +216,9 @@ scope it needs; see [Scopes](#scopes).
   endpoints in `src/tesla/endpoints.ts`, from fixed path templates. It is not a generic proxy.
 - **Secrets stay secret.** Tesla tokens are stored AES-256-GCM encrypted in a Durable Object. Tokens, keys, and
   raw Tesla responses are never logged or written to the audit log.
-- **Fail closed.** No `MCP_BEARER_TOKEN` means every `/mcp` request is refused. A command key that does not match
-  the published public key refuses to sign.
+- **Fail closed.** `/mcp` refuses every request without a valid `MCP_BEARER_TOKEN` or OAuth access token, and
+  `/authorize` approves nothing while `OAUTH_ADMIN_PASSPHRASE` is unset. A command key that does not match the
+  published public key refuses to sign.
 
 ## Locking
 
@@ -231,10 +234,12 @@ locked), `woke`, and `attempts`. A failure carries `error` and a specific `reaso
 
 The server runs nothing on its own. To lock the car every night (or on any other schedule), let your own scheduler
 (cron, a systemd timer, an assistant's routine, a CI job) call the MCP tools at `https://<your-domain>/mcp` with
-`Authorization: Bearer <MCP_BEARER_TOKEN>`:
+`Authorization: Bearer <MCP_BEARER_TOKEN>` (or an access token for a [static client](#static-clients-one-per-agent)
+created for the job):
 1. Optionally call `tesla_auth_status`. If `authState` is `reauth_required`, alert the owner to sign in again
    (below) instead of trying to lock.
-2. Call `tesla_lock` with `{"confirm": true}` (and `vehicle_id` if the account has more than one car). Allow the
+2. Call `tesla_lock` with `{"confirm": true}` (and `vehicle_id` if the account has more than one car and
+   `DEFAULT_VIN` is not set). Allow the
    call up to about 8 minutes: an asleep car is woken and retried within the 7-minute budget.
 3. Treat `locked: true` as success; `confirmed: false` means Tesla accepted the lock but the car's state could not
    be read back. On `isError`, alert on `error` and `reason` (for example `reauth_required`, `pairing_required`,
@@ -285,7 +290,10 @@ from it). Node 22 or newer.
    (newlines as `\n`). After deploying, it is served at
    `https://<your-domain>/.well-known/appspecific/com.tesla.3p.public-key.pem`. If your account is outside North
    America, change `TESLA_FLEET_BASE_URL` to your region's Fleet API host. Set `OAUTH_REDIRECT_BASE` to
-   `https://<your-domain>`: browser sign-in sends Tesla `${OAUTH_REDIRECT_BASE}/callback`.
+   `https://<your-domain>`: browser sign-in sends Tesla `${OAUTH_REDIRECT_BASE}/callback`. If the account has more
+   than one car, set `DEFAULT_VIN` to the VIN (or Fleet vehicle id) tools should use when called without
+   `vehicle_id`; it must be a car on the account. Left empty, the account's only car is used, and an account with
+   several cars needs `vehicle_id` on every call (the error lists each car's name, id, and VIN).
 
 4. **Set secrets** (see `.dev.vars.example` for what each one is):
 
@@ -297,7 +305,17 @@ from it). Node 22 or newer.
      | npx wrangler secret put TESLA_COMMAND_PRIVATE_KEY_PKCS8_B64
    openssl rand -base64 32 | npx wrangler secret put TOKEN_ENCRYPTION_KEY
    npx wrangler secret put TESLA_BOOTSTRAP_REFRESH_TOKEN   # optional, see step 7
-   npx wrangler secret put TESLA_VEHICLE_ID                # optional
+   npx wrangler secret put OAUTH_ADMIN_PASSPHRASE          # approves OAuth clients at /authorize
+   ```
+
+   Choose a long passphrase for `OAUTH_ADMIN_PASSPHRASE` (for example `openssl rand -base64 24`) and keep it in a
+   password manager: anyone who knows it can connect an MCP client. Without it, `/authorize` refuses every request.
+
+   **Create the OAuth KV namespace** and put the id it prints into `kv_namespaces` in `wrangler.jsonc` (replacing
+   `REPLACE_WITH_OAUTH_KV_ID`):
+
+   ```sh
+   npx wrangler kv namespace create OAUTH_KV
    ```
 
 5. **Deploy** with `npm ci && npx wrangler deploy`, then attach your domain to the Worker (Workers & Pages → your
@@ -350,8 +368,83 @@ from it). Node 22 or newer.
 8. **Pair the virtual key with the car.** On the phone with the Tesla app, open `https://tesla.com/_ak/<your-domain>`
    and approve the key. Signed commands fail with "pairing required" until this is done.
 
-9. **Connect your MCP client** to `https://<your-domain>/mcp` with the header
-   `Authorization: Bearer <MCP_BEARER_TOKEN>`.
+9. **Connect your MCP client** to `https://<your-domain>/mcp`: see [Connecting MCP clients](#connecting-mcp-clients).
+
+## Connecting MCP clients
+
+`/mcp` accepts either credential in `Authorization: Bearer ...`:
+- the static `MCP_BEARER_TOKEN`, exactly as before (compared in constant time), for scripts and clients that take a
+  fixed header; or
+- an access token from the server's OAuth 2.1 front door, for clients such as Claude's custom connectors that sign
+  in with OAuth.
+
+A request without a valid one gets `401` with
+`WWW-Authenticate: Bearer realm="tesla-mcp", resource_metadata="https://<host>/.well-known/oauth-protected-resource/mcp", ...`,
+where MCP clients start OAuth discovery. The host is the one the request was sent to.
+
+### OAuth endpoints
+
+| Endpoint                                                                                 | What it is                                                                                                                                                                                                  |
+| ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /.well-known/oauth-protected-resource`, `/.well-known/oauth-protected-resource/mcp` | Protected resource metadata (RFC 9728): `resource` is `https://<host>/mcp`, `authorization_servers` is `https://<host>`.                                                                                    |
+| `GET /.well-known/oauth-authorization-server`                                            | Authorization server metadata (RFC 8414): `/authorize`, `/token`, `/register`, PKCE `S256` only, `authorization_code` and `refresh_token`, client auth `none`, `client_secret_post`, `client_secret_basic`. |
+| `POST /register`                                                                         | Dynamic client registration (RFC 7591). Redirect URIs must be on the [allowlist](#redirect-uri-allowlist).                                                                                                  |
+| `GET /authorize`                                                                         | The approval page: shows the client's name and redirect URI and asks for `OAUTH_ADMIN_PASSPHRASE`. PKCE with `S256` is required for every client.                                                           |
+| `POST /token`                                                                            | Exchanges the code (with the PKCE verifier) and refreshes tokens. Refresh tokens rotate: once the new one is used, the old one is dead. Also handles revocation (RFC 7009).                                 |
+| `GET, POST /admin/clients`, `DELETE /admin/clients/<id>`                                 | Static clients (below). Needs `MCP_BEARER_TOKEN`.                                                                                                                                                           |
+
+Access tokens last an hour and refresh tokens 30 days. Tokens, codes, and client secrets are stored in the `OAUTH_KV`
+namespace only as hashes (by [`@cloudflare/workers-oauth-provider`](https://github.com/cloudflare/workers-oauth-provider)).
+`/mcp`, `/token`, `/register`, and `/.well-known/*` answer CORS preflights before any authentication, allow the
+`Authorization`, `Content-Type`, `Mcp-Session-Id`, and `Mcp-Protocol-Version` headers, and expose `WWW-Authenticate`.
+
+**The approval page** is gated by the `OAUTH_ADMIN_PASSPHRASE` secret. Each page carries a one-time approval token
+bound to that exact request (10 minutes, single use), so a form cannot be replayed or posted from elsewhere. After 5
+wrong passphrases from one IP, that IP is refused for 15 minutes. Only approve a connection you just started.
+
+### Claude (custom connector)
+
+In Claude, add a custom connector with the URL `https://tesla-mcp.sean-1b3.workers.dev/mcp` (or
+`https://<your-domain>/mcp` for your own deployment). Then either:
+- **Dynamic registration:** leave the OAuth client ID and secret empty. Claude registers itself at `/register`,
+  opens `/authorize`, and you type `OAUTH_ADMIN_PASSPHRASE` to approve; or
+- **Static client:** create one (below) with the default redirect URIs, and paste its `client_id` and
+  `client_secret` into the connector's advanced settings. You still approve once at `/authorize`.
+
+### Static clients (one per agent)
+
+Give each agent or script its own client, so it can be revoked on its own. Create one (the secret is shown once,
+and stored only as a hash):
+
+```sh
+curl -s -X POST https://<your-domain>/admin/clients \
+  -H "Authorization: Bearer $MCP_BEARER_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name": "nightly-lock agent", "redirect_uris": ["http://localhost:8976/callback"]}'
+# {"client_id":"...","client_secret":"...","redirect_uris":[...],...}
+```
+
+`redirect_uris` is optional and defaults to Claude's two callbacks. The client authenticates at `/token` with
+`client_secret_basic` or `client_secret_post`, and still uses PKCE. List clients (ids, names, redirect URIs; never
+secrets), including dynamically registered ones:
+
+```sh
+curl -s https://<your-domain>/admin/clients -H "Authorization: Bearer $MCP_BEARER_TOKEN"
+```
+
+Revoke a client: it can no longer sign in or refresh, and every access and refresh token it holds is rejected at once.
+
+```sh
+curl -s -X DELETE https://<your-domain>/admin/clients/<client_id> -H "Authorization: Bearer $MCP_BEARER_TOKEN"
+```
+
+### Redirect URI allowlist
+
+Registration (`/register` and `/admin/clients`) and every `/authorize` request accept only:
+- `https://claude.ai/api/mcp/auth_callback` and `https://claude.com/api/mcp/auth_callback`;
+- `http://localhost:<any port>/<any path>` and `http://127.0.0.1:<any port>/<any path>`, for local MCP clients;
+- any URI listed, comma separated and matched exactly, in the `OAUTH_EXTRA_REDIRECT_URIS` var in `wrangler.jsonc`.
+
+Removing a URI from `OAUTH_EXTRA_REDIRECT_URIS` stops `/authorize` from using it for clients registered earlier too.
 
 ## Development
 

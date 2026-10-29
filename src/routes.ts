@@ -1,12 +1,27 @@
-// HTTP routes: security headers, the public key, browser sign-in (/login and
-// /callback), and the /mcp transport.
+// HTTP routes: security headers, CORS, the public key, browser sign-in (/login
+// and /callback), the OAuth front door (discovery, /authorize, /token,
+// /register, /admin/clients), and the /mcp transport.
 // Kept out of index.ts because the Worker entry module may only export
 // handlers and Durable Object classes.
 
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { bearerTokenAuthenticator, type McpAuthenticator, OWNER_ID } from "./auth";
+import { readBoundedBody } from "./body";
 import type { Env } from "./env";
+import { escapeHtml } from "./html";
 import { createMcpServer } from "./mcp/server";
+import { handleAdminClients, isAdminClientsPath } from "./oauth/admin";
+import { handleAuthorize } from "./oauth/authorize";
+import {
+  AUTHORIZATION_SERVER_METADATA_PATH,
+  AUTHORIZE_PATH,
+  authorizationServer,
+  MCP_PATH,
+  PROTECTED_RESOURCE_METADATA_PATHS,
+  protectedResourceMetadata,
+  REGISTER_PATH,
+  TOKEN_PATH,
+} from "./oauth/server";
 import type { SignInResult } from "./owner/state";
 import { authorizeUrl, signInRedirectUri } from "./tesla/oauth";
 
@@ -22,10 +37,35 @@ const SECURITY_HEADERS: Record<string, string> = {
   "Cross-Origin-Resource-Policy": "same-origin",
 };
 
-function secure(response: Response, cache = "no-store"): Response {
+/** Browser MCP and OAuth clients call these cross-origin. Bearer tokens are
+ * not ambient credentials, so any origin may present one it holds. */
+const CORS_HEADERS: Record<string, string> = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, Mcp-Session-Id, Mcp-Protocol-Version, Last-Event-ID",
+  "Access-Control-Expose-Headers": "WWW-Authenticate, Mcp-Session-Id, Mcp-Protocol-Version",
+  "Access-Control-Max-Age": "86400",
+};
+
+function corsPath(pathname: string): boolean {
+  return (
+    pathname === MCP_PATH ||
+    pathname === TOKEN_PATH ||
+    pathname === REGISTER_PATH ||
+    pathname.startsWith("/.well-known/")
+  );
+}
+
+function withCors(response: Response): Response {
+  const headers = new Headers(response.headers);
+  for (const [name, value] of Object.entries(CORS_HEADERS)) headers.set(name, value);
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+function secure(response: Response): Response {
   const headers = new Headers(response.headers);
   for (const [name, value] of Object.entries(SECURITY_HEADERS)) headers.set(name, value);
-  if (!headers.has("Cache-Control")) headers.set("Cache-Control", cache);
+  if (!headers.has("Cache-Control")) headers.set("Cache-Control", "no-store");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
@@ -40,13 +80,6 @@ const HOME_PAGE = `<!doctype html>
 <p>Source: <a href="https://github.com/Oceanswave/tesla-mcp">github.com/Oceanswave/tesla-mcp</a></p>
 </body></html>
 `;
-
-function escapeHtml(value: string): string {
-  return value.replace(
-    /[&<>"']/g,
-    (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char,
-  );
-}
 
 /** A plain sign-in page. `message` is escaped; it never carries a code or token. */
 function signInPage(message: string, status: number): Response {
@@ -102,39 +135,13 @@ async function handleCallback(url: URL, env: Env, ownerId: string): Promise<Resp
   return signInPage(message, status);
 }
 
-async function readBoundedBody(request: Request): Promise<Uint8Array | null> {
-  const declared = request.headers.get("Content-Length");
-  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_MCP_BODY_BYTES)) return null;
-  if (!request.body) return new Uint8Array();
-  const reader = request.body.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > MAX_MCP_BODY_BYTES) {
-      await reader.cancel().catch(() => {});
-      return null;
-    }
-    chunks.push(value);
-  }
-  const body = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    body.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return body;
-}
-
 async function handleMcp(request: Request, env: Env, authenticator: McpAuthenticator): Promise<Response> {
   const auth = await authenticator.authenticate(request, env);
   if (!auth.ok) return auth.response;
 
   let forwarded = request;
   if (request.method === "POST") {
-    const body = await readBoundedBody(request);
+    const body = await readBoundedBody(request, MAX_MCP_BODY_BYTES);
     if (!body) {
       return Response.json(
         { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Request body too large." } },
@@ -155,28 +162,55 @@ async function handleMcp(request: Request, env: Env, authenticator: McpAuthentic
   return response;
 }
 
-/** `signInOwnerId` names the OwnerState that browser sign-in updates (the
- * single owner; tests pass their own). */
+export type RouteOptions = {
+  /** Authenticates /mcp; tests substitute their own. */
+  authenticator?: McpAuthenticator;
+  /** The OwnerState browser sign-in updates (the single owner; tests pass their own). */
+  signInOwnerId?: string;
+};
+
+async function route(request: Request, env: Env, ctx: ExecutionContext, options: RouteOptions): Promise<Response> {
+  const url = new URL(request.url);
+  const read = request.method === "GET" || request.method === "HEAD";
+  // Preflights are answered before any authentication.
+  if (request.method === "OPTIONS" && corsPath(url.pathname)) return new Response(null, { status: 204 });
+  if (url.pathname === MCP_PATH) return handleMcp(request, env, options.authenticator ?? bearerTokenAuthenticator);
+  if (read && url.pathname === "/") return text(HOME_PAGE, 200, "text/html; charset=utf-8");
+  if (read && url.pathname === "/healthz") return Response.json({ status: "ok", service: "tesla-mcp" });
+  if (read && url.pathname === PUBLIC_KEY_PATH) {
+    const response = text(env.TESLA_PUBLIC_KEY_PEM, 200, "application/x-pem-file");
+    response.headers.set("Cache-Control", "public, max-age=3600");
+    return response;
+  }
+  if (read && PROTECTED_RESOURCE_METADATA_PATHS.includes(url.pathname)) return protectedResourceMetadata(url.origin);
+  // GET only: a HEAD (a link check, a prefetch) must not create or consume a sign-in.
+  const signInOwnerId = options.signInOwnerId ?? OWNER_ID;
+  if (request.method === "GET" && url.pathname === "/login") return handleLogin(env, signInOwnerId);
+  if (request.method === "GET" && url.pathname === "/callback") return handleCallback(url, env, signInOwnerId);
+
+  const oauthPath =
+    url.pathname === AUTHORIZATION_SERVER_METADATA_PATH ||
+    url.pathname === AUTHORIZE_PATH ||
+    url.pathname === TOKEN_PATH ||
+    url.pathname === REGISTER_PATH ||
+    isAdminClientsPath(url.pathname);
+  if (oauthPath) {
+    const server = authorizationServer(url, env);
+    if (!server) return text("Not found\n", 404);
+    if (url.pathname === AUTHORIZE_PATH) return handleAuthorize(request, env, server);
+    if (isAdminClientsPath(url.pathname)) return handleAdminClients(request, env, server);
+    return server.fetch(request, env, ctx);
+  }
+  return text("Not found\n", 404);
+}
+
 export async function handleRequest(
   request: Request,
   env: Env,
-  authenticator: McpAuthenticator = bearerTokenAuthenticator,
-  signInOwnerId: string = OWNER_ID,
+  ctx: ExecutionContext,
+  options: RouteOptions = {},
 ): Promise<Response> {
-  const url = new URL(request.url);
-  const read = request.method === "GET" || request.method === "HEAD";
-  if (url.pathname === "/mcp") return secure(await handleMcp(request, env, authenticator));
-  if (read && url.pathname === "/") return secure(text(HOME_PAGE, 200, "text/html; charset=utf-8"));
-  if (read && url.pathname === "/healthz") {
-    return secure(Response.json({ status: "ok", service: "tesla-mcp" }));
-  }
-  if (read && url.pathname === PUBLIC_KEY_PATH) {
-    return secure(text(env.TESLA_PUBLIC_KEY_PEM, 200, "application/x-pem-file"), "public, max-age=3600");
-  }
-  // GET only: a HEAD (a link check, a prefetch) must not create or consume a sign-in.
-  if (request.method === "GET" && url.pathname === "/login") return secure(await handleLogin(env, signInOwnerId));
-  if (request.method === "GET" && url.pathname === "/callback") {
-    return secure(await handleCallback(url, env, signInOwnerId));
-  }
-  return secure(text("Not found\n", 404));
+  const response = await route(request, env, ctx, options);
+  const secured = secure(response);
+  return corsPath(new URL(request.url).pathname) ? withCors(secured) : secured;
 }

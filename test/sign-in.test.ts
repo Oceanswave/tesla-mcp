@@ -1,4 +1,4 @@
-import { runInDurableObject } from "cloudflare:test";
+import { createExecutionContext, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -64,7 +64,9 @@ function tesla(
 
 function browser(ownerId: string, overrides: Partial<typeof env> = {}) {
   const get = (path: string, method = "GET") =>
-    handleRequest(new Request(`${BASE}${path}`, { method }), { ...env, ...overrides }, undefined, ownerId);
+    handleRequest(new Request(`${BASE}${path}`, { method }), { ...env, ...overrides }, createExecutionContext(), {
+      signInOwnerId: ownerId,
+    });
   return {
     get,
     /** GET /login and return the state from Tesla's authorize URL. */
@@ -110,7 +112,9 @@ describe("GET /login", () => {
   it("takes the redirect URI from OAUTH_REDIRECT_BASE whatever the request host", async () => {
     const ownerId = uniqueName("login");
     for (const host of ["https://tesla-mcp.example", "https://attacker.example", "http://localhost:8787"]) {
-      const response = await handleRequest(new Request(`${host}/login`), env, undefined, ownerId);
+      const response = await handleRequest(new Request(`${host}/login`), env, createExecutionContext(), {
+        signInOwnerId: ownerId,
+      });
       expect(new URL(response.headers.get("Location") as string).searchParams.get("redirect_uri")).toBe(REDIRECT_URI);
     }
     const custom = await browser(ownerId, { OAUTH_REDIRECT_BASE: " https://cars.example.net/base// " }).get("/login");
@@ -139,7 +143,9 @@ describe("GET /login", () => {
       }
     }
     const { OAUTH_REDIRECT_BASE: _omitted, ...missing } = env;
-    const unset = await handleRequest(new Request(`${BASE}/login`), missing as typeof env, undefined, ownerId);
+    const unset = await handleRequest(new Request(`${BASE}/login`), missing as typeof env, createExecutionContext(), {
+      signInOwnerId: ownerId,
+    });
     expect(unset.status).toBe(503);
     expect((await browser(ownerId, { TESLA_CLIENT_ID: "" }).get("/login")).status).toBe(503);
     // HEAD never creates a sign-in.
@@ -387,13 +393,15 @@ describe("GET /callback", () => {
     const client = new Client({ name: "tesla-mcp-test", version: "1.0.0" });
     const transport = new StreamableHTTPClientTransport(new URL(`${BASE}/mcp`), {
       fetch: (url, init) =>
-        handleRequest(new Request(url, init), env, {
-          authenticate: async () => ({ ok: true, principal: { ownerId } }),
+        handleRequest(new Request(url, init), env, createExecutionContext(), {
+          authenticator: { authenticate: async () => ({ ok: true, principal: { ownerId } }) },
         }),
     });
     await client.connect(transport);
     const listed = (await client.callTool({ name: "tesla_vehicles_list", arguments: {} })) as ToolResult;
-    expect(listed.structuredContent?.vehicles).toEqual([{ id: fake.vehicleId, name: "Test Car", state: "online" }]);
+    expect(listed.structuredContent?.vehicles).toEqual([
+      { id: fake.vehicleId, vin: fake.vin, name: "Test Car", state: "online" },
+    ]);
     expect(fake.fleetRequests.at(-1)?.authorization).toBe(`Bearer ${fake.issuedAccessTokens.at(-1)}`);
     const status = (await client.callTool({ name: "tesla_auth_status", arguments: {} })) as ToolResult;
     expect(status.structuredContent).toMatchObject({ authState: "ok", scopes: SCOPES });
