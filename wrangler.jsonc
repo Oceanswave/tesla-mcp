@@ -22,7 +22,7 @@
   // OAuth front door for /mcp: client registrations, hashed tokens, one-time
   // approval tokens, and failed-passphrase counters. Create it with
   // `npx wrangler kv namespace create OAUTH_KV` and put its id here.
-  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "REPLACE_WITH_OAUTH_KV_ID" }],
+  "kv_namespaces": [{ "binding": "OAUTH_KV", "id": "c207bed74c1c401cbff966048a4d4aaf" }],
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["OwnerState", "TeslaVcpSession"] }],
   // Non-secret configuration. Secrets are listed in .dev.vars.example and set
   // with `wrangler secret put`.
@@ -39,7 +39,7 @@
     "OAUTH_REDIRECT_BASE": "https://tesla-mcp.sean-1b3.workers.dev",
     // The car tools use when called without vehicle_id: a VIN or Fleet vehicle
     // id. Empty: the account's only car (more than one car needs vehicle_id).
-    "DEFAULT_VIN": "",
+    "DEFAULT_VIN": "3744575790395509",
     // Extra OAuth redirect URIs, comma separated, beyond the built-in Claude
     // callbacks and http://localhost / http://127.0.0.1 on any port.
     "OAUTH_EXTRA_REDIRECT_URIS": ""
