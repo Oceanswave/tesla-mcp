@@ -20,7 +20,7 @@ jobs:
       pull-requests: write
       checks: read
       statuses: read
-    uses: Oceanswave/github-workflows/.github/workflows/merge.yml@125b14d3312b525c8f5b42e9f1c7a9e172d1b23f # main
+    uses: Oceanswave/github-workflows/.github/workflows/merge.yml@6cdca8dfad892359b266326b6f74ba012418dac4 # main
     with:
       runs-on: '["self-hosted","Linux","X64","tesla-mcp"]'
       head-branch: ${{ github.event.workflow_run.head_branch }}
