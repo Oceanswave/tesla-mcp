@@ -14,9 +14,9 @@ concurrency:
 
 jobs:
   verify:
-    # Fork PRs must not run on the self-hosted runner.
+    # Same-repo PRs only (public repo; GitHub-hosted runner).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, tesla-mcp]
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -35,9 +35,9 @@ jobs:
           WRANGLER_SEND_METRICS: "false"
 
   secret-scan:
-    # Fork PRs must not run on the self-hosted runner.
+    # Same-repo PRs only (public repo; GitHub-hosted runner).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, tesla-mcp]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       GITLEAKS_VERSION: 8.30.1
@@ -63,9 +63,9 @@ jobs:
         run: gitleaks git --redact --exit-code 1 .
 
   go-conformance:
-    # Fork PRs must not run on the self-hosted runner.
+    # Same-repo PRs only (public repo; GitHub-hosted runner).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Linux, X64, tesla-mcp]
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -79,11 +79,11 @@ jobs:
         run: bash conformance/run.sh
 
   deploy-dry-run:
-    # Fork PRs must not run on the self-hosted runner.
+    # Same-repo PRs only (public repo; GitHub-hosted runner).
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     uses: Oceanswave/github-workflows/.github/workflows/wrangler-deploy.yml@125b14d3312b525c8f5b42e9f1c7a9e172d1b23f
     with:
-      runs-on: '["self-hosted","Linux","X64","tesla-mcp"]'
+      runs-on: '"ubuntu-latest"'
       working-directory: "."
       test-command: npm ci && npm test
       wrangler-version: 4.152.0
