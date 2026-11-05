@@ -1,0 +1,32 @@
+name: Cleanup Closed PR Branches
+
+# delete_branch_on_merge only covers merged PRs; this removes branches from
+# PRs closed without merging.
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  delete-branch:
+    name: Delete unmerged PR branch
+    # Never the default branch or the PR's base (the ruleset also blocks deleting main).
+    if: >
+      github.event.pull_request.merged == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch &&
+      github.event.pull_request.head.ref != github.event.pull_request.base.ref
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete branch
+        # head.ref is untrusted input — always pass via env, never inline.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          gh api -X DELETE "repos/$REPO/git/refs/heads/$BRANCH" \
+            || echo "Branch already gone"
