@@ -247,6 +247,70 @@ created for the job):
 
 Every call is in the audit log (`tesla_audit_recent`).
 
+## Command notifications (webhook)
+
+The server can POST one JSON message to a webhook of your choice for every audited command, in the background: a
+failed or slow send never blocks or fails the command. Reads are not audited, so they send nothing.
+
+Set it up with a dry run first:
+
+1. Store the secrets. `NOTIFY_AUTH` is the full `Authorization` header value, scheme included:
+
+   ```sh
+   npx wrangler secret put NOTIFY_URL
+   npx wrangler secret put NOTIFY_AUTH
+   ```
+
+2. Set `NOTIFY_DRY_RUN` to `"true"` in `wrangler.jsonc` and deploy. Run a command and check `npx wrangler tail` for the
+   logged payload. A dry run logs the payload (never the URL or auth value) and sends nothing.
+3. Set `NOTIFY_DRY_RUN` back to `"false"` and deploy.
+4. Tell whoever runs the receiving webhook before the first live test.
+5. Run one real `tesla_wake` and confirm that one text arrives.
+
+Without `NOTIFY_URL` nothing is sent; with it but without `NOTIFY_AUTH`, nothing is sent and an error is logged.
+
+### Payload
+
+```json
+{
+  "source": "tesla-mcp",
+  "event": "command",
+  "id": "1042",
+  "ts": "2026-10-31T12:00:00.000Z",
+  "action": "door_unlock",
+  "caller": "tool",
+  "outcome": "denied",
+  "detail": "dangerous_disabled",
+  "vehicle": "…0123",
+  "dangerous": true
+}
+```
+
+- `id` is the audit row's id; `action`, `outcome`, and `detail` are as `tesla_audit_recent` shows them, except that any
+  VIN or long id in `detail` (such as an energy site id) is cut to its last 4 characters.
+- `caller` is the audit source: `tool`, or `system` for the server's own events (`tokens_seeded`, `token_refresh`,
+  `browser_sign_in`). A read that seeds a new token, or finds that a refresh failed, can cause one of these.
+- `vehicle` is `…` and the last 4 characters of the Fleet vehicle id, or `null`.
+- `dangerous` says whether this is one of the dangerous commands from the [safety model](#safety-model), whether or not
+  it ran.
+- No tokens, full VINs or ids, locations, or command parameters are ever included.
+
+Requests carry `Authorization: <NOTIFY_AUTH>`, `Content-Type: application/json`, and `Idempotency-Key: tesla-<id>`,
+which is the same on a retry, so the receiver can drop duplicates. Each attempt times out after 5 seconds. A network
+error, a timeout, or a 5xx other than 504 is retried exactly once; a 504, a 4xx, or a redirect is not.
+
+### Filters
+
+Optional comma-separated allow-lists, set in `vars` in `wrangler.jsonc`. A row must pass both:
+
+- `NOTIFY_ACTIONS`: audit action names, such as `lock,wake,door_unlock` (see `tesla_audit_recent`; these are not tool
+  names). Empty: all.
+- `NOTIFY_OUTCOMES`: any of `ok`, `error`, `denied`. Empty: all.
+
+Filters only narrow routine traffic: a refusal (outcome `denied`) always notifies. That covers a dangerous command
+the server refused and any command called without `confirm: true`. Dry-run tool calls are audited, so they notify
+too, with `detail` `dry_run`.
+
 ## Scopes
 
 Browser sign-in (`/login`) asks Tesla for all nine scopes the tools use, with `prompt_missing_scopes=true` so an

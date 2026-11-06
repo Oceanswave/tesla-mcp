@@ -23,6 +23,7 @@ import type { CommandParams } from "../tesla/vcp/payloads";
 import { isSignedCommandName, type SignedCommandName } from "../tesla/vcp/protocol";
 import type { SignedCommandResult, VcpErrorCode } from "../tesla/vcp/session";
 import { LOCK_POLICY, type LockFailureCode, type LockOutcome, lockWithRetry } from "./lock";
+import { notifyAudit } from "./notify";
 import { decryptTokens, encryptTokens, importTokenKey, type StoredTokens } from "./tokens";
 
 const REFRESH_MARGIN_MS = 5 * 60_000;
@@ -54,6 +55,11 @@ export type AuditRow = {
   outcome: AuditOutcome;
   detail: string;
 };
+
+/** `dangerous` is not stored: it only says, for the webhook, whether this was
+ * a dangerous command. Only the caller knows, since Sentry Mode depends on its
+ * parameters. */
+export type AuditEntry = Omit<AuditRow, "ts"> & { dangerous?: boolean };
 
 export type OwnerErrorCode =
   | "not_configured"
@@ -212,24 +218,35 @@ export class OwnerState extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM kv WHERE key = ?", key);
   }
 
-  async recordAudit(entry: Omit<AuditRow, "ts">): Promise<void> {
+  async recordAudit(entry: AuditEntry): Promise<void> {
     this.audit(entry);
   }
 
-  private audit(entry: Omit<AuditRow, "ts">): void {
-    this.ctx.storage.sql.exec(
-      "INSERT INTO audit (ts, source, action, vehicle_id, outcome, detail) VALUES (?, ?, ?, ?, ?, ?)",
-      new Date(this.clock()).toISOString(),
-      entry.source,
-      entry.action.slice(0, 64),
-      entry.vehicleId,
-      entry.outcome,
-      redactDetail(entry.detail),
-    );
+  private audit(entry: AuditEntry): void {
+    const row = {
+      ts: new Date(this.clock()).toISOString(),
+      source: entry.source,
+      action: entry.action.slice(0, 64),
+      vehicleId: entry.vehicleId,
+      outcome: entry.outcome,
+      detail: redactDetail(entry.detail),
+    };
+    const { id } = this.ctx.storage.sql
+      .exec<{ id: number }>(
+        "INSERT INTO audit (ts, source, action, vehicle_id, outcome, detail) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        row.ts,
+        row.source,
+        row.action,
+        row.vehicleId,
+        row.outcome,
+        row.detail,
+      )
+      .one();
     this.ctx.storage.sql.exec(
       "DELETE FROM audit WHERE id <= (SELECT id FROM audit ORDER BY id DESC LIMIT 1 OFFSET ?)",
       AUDIT_KEEP_ROWS,
     );
+    this.ctx.waitUntil(notifyAudit(this.env, this.fetchFn, { ...row, id, dangerous: entry.dangerous === true }));
   }
 
   async auditRecent(limit = 20): Promise<AuditRow[]> {
@@ -769,6 +786,11 @@ export class OwnerState extends DurableObject<Env> {
   // Allowlisted Fleet endpoints and signed commands
   // ---------------------------------------------------------------------------
 
+  /** A command the dangerous gate refused is a denial, not a failure. */
+  private failureOutcome(error: unknown): AuditOutcome {
+    return error instanceof OwnerError && error.code === "dangerous_disabled" ? "denied" : "error";
+  }
+
   private refuseDangerous(action: DangerousAction | undefined): void {
     if (action && !dangerousCommandsEnabled(this.env)) {
       throw new OwnerError(
@@ -788,11 +810,13 @@ export class OwnerState extends DurableObject<Env> {
     const endpoint: (typeof FLEET_ENDPOINTS)[FleetEndpointName] = FLEET_ENDPOINTS[name];
     const params = input.params ?? {};
     const scopes = endpointScopes(name, params);
+    const dangerousAction = "dangerousAction" in endpoint ? endpoint.dangerousAction : undefined;
+    const dangerous = dangerousAction !== undefined;
     const run = async (): Promise<OwnerResult<EndpointSuccess>> => {
       let vehicleId: string | null = auditableVehicleId(input.vehicleId);
       let energySiteId: string | null = input.energySiteId ?? null;
       try {
-        this.refuseDangerous("dangerousAction" in endpoint ? endpoint.dangerousAction : undefined);
+        this.refuseDangerous(dangerousAction);
         let vin: string | undefined;
         if (endpoint.target === "vehicle") {
           const vehicle = await this.resolveVehicle(input.vehicleId);
@@ -812,7 +836,14 @@ export class OwnerState extends DurableObject<Env> {
           const response = data && typeof data === "object" ? (data as Record<string, unknown>) : {};
           if (response.result !== true) {
             const carReason = sanitizeCarReason(response.reason);
-            this.audit({ source: "tool", action: name, vehicleId, outcome: "error", detail: `rejected ${carReason}` });
+            this.audit({
+              source: "tool",
+              action: name,
+              vehicleId,
+              outcome: "error",
+              detail: `rejected ${carReason}`,
+              dangerous,
+            });
             return {
               ok: false,
               error: {
@@ -831,6 +862,7 @@ export class OwnerState extends DurableObject<Env> {
             vehicleId,
             outcome: "ok",
             detail: energySiteId ? `site ${energySiteId}` : "ok",
+            dangerous,
           });
         }
         return {
@@ -855,8 +887,9 @@ export class OwnerState extends DurableObject<Env> {
             source: "tool",
             action: name,
             vehicleId,
-            outcome: "error",
+            outcome: this.failureOutcome(error),
             detail: unknownOutcome ? `status_unknown ${this.errorDetail(error)}` : this.errorDetail(error),
+            dangerous,
           });
         }
         if (unknownOutcome) {
@@ -907,15 +940,17 @@ export class OwnerState extends DurableObject<Env> {
       return { ok: false, error: { code: "invalid_request", message: "Unknown command." } };
     }
     const params = input.params ?? {};
+    const dangerousAction = dangerousSignedCommand(command, params);
+    const dangerous = dangerousAction !== undefined;
     return this.inLane(async () => {
       let vehicleId: string | null = auditableVehicleId(input.vehicleId);
       try {
-        this.refuseDangerous(dangerousSignedCommand(command, params));
+        this.refuseDangerous(dangerousAction);
         const vehicle = await this.resolveVehicle(input.vehicleId);
         vehicleId = vehicle.id;
         const sent = await this.signed(vehicle.vin, command, params);
         if (sent.ok) {
-          this.audit({ source: "tool", action: command, vehicleId, outcome: "ok", detail: "signed" });
+          this.audit({ source: "tool", action: command, vehicleId, outcome: "ok", detail: "signed", dangerous });
           return { ok: true as const, data: { vehicleId: vehicle.id } };
         }
         const { code, stage, reason } = sent.error;
@@ -925,10 +960,18 @@ export class OwnerState extends DurableObject<Env> {
           vehicleId,
           outcome: "error",
           detail: `${code} ${stage}${reason ? ` ${reason}` : ""}`,
+          dangerous,
         });
         return { ok: false as const, error: signedFailure(code, stage, reason, signedCommandScopes(command)) };
       } catch (error) {
-        this.audit({ source: "tool", action: command, vehicleId, outcome: "error", detail: this.errorDetail(error) });
+        this.audit({
+          source: "tool",
+          action: command,
+          vehicleId,
+          outcome: this.failureOutcome(error),
+          detail: this.errorDetail(error),
+          dangerous,
+        });
         return this.failure(error, signedCommandScopes(command));
       }
     });

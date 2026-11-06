@@ -31,3 +31,8 @@ TESLA_BOOTSTRAP_REFRESH_TOKEN=replace-with-a-refresh-token
 # (Claude's connector, or a static client from /admin/clients). Unset: every
 # authorization is refused. Generate: openssl rand -base64 24
 OAUTH_ADMIN_PASSPHRASE=replace-with-a-long-random-passphrase
+
+# Optional: a webhook told about each audited command. Unset: no notifications.
+NOTIFY_URL=https://example.com/replace-with-your-webhook
+# The full Authorization header value the webhook expects, scheme included.
+NOTIFY_AUTH=replace-with-the-full-authorization-header-value

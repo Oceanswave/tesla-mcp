@@ -39,7 +39,7 @@ and of the lock retry logic matters more than speed.
 - `src/mcp/`: core tool definitions and the confirm gate (`server.ts`), the declarative catalog of every other tool
   (`catalog.ts`), and the dangerous-command gate.
 - `src/owner/`: `OwnerState` Durable Object (encrypted tokens, sign-in state, audit log, command lane), the lock
-  retry policy, token encryption.
+  retry policy, token encryption, the audit webhook (`notify.ts`).
 - `src/tesla/`: Fleet REST client, the REST endpoint allowlist (`endpoints.ts`), bounded HTTP helpers, and `vcp/`
   (protobuf wire codec, command payload builders, envelope and crypto, and the per-VIN `TeslaVcpSession` Durable
   Object).
