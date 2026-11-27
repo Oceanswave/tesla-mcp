@@ -95,6 +95,7 @@ async function commandGate(
   input: Record<string, unknown>,
   describe: string,
   run: () => Promise<CallToolResult>,
+  dangerous = false,
 ): Promise<CallToolResult> {
   const requested = typeof input.vehicle_id === "string" ? input.vehicle_id : null;
   // The audit log keeps Fleet ids only; a VIN stays out of it.
@@ -106,6 +107,7 @@ async function commandGate(
       vehicleId: vehicle,
       outcome: "denied",
       detail: "confirm_required",
+      dangerous,
     });
     return result(
       {
@@ -116,7 +118,14 @@ async function commandGate(
     );
   }
   if (input.dryRun === true) {
-    await owner.recordAudit({ source: "tool", action, vehicleId: vehicle, outcome: "ok", detail: "dry_run" });
+    await owner.recordAudit({
+      source: "tool",
+      action,
+      vehicleId: vehicle,
+      outcome: "ok",
+      detail: "dry_run",
+      dangerous,
+    });
     return result({
       summary: `Dry run: this would ${describe}. Nothing was sent to Tesla.`,
       dryRun: true,
@@ -203,7 +212,14 @@ function catalogTool(owner: OwnerStub, spec: ToolSpec): ToolDefinition {
     handler: mutates
       ? (input) => {
           const action = spec.kind === "signed" ? spec.action : (spec.action ?? spec.name);
-          return commandGate(owner, auditAction, input, summaryText(action, input), () => run(input));
+          return commandGate(
+            owner,
+            auditAction,
+            input,
+            summaryText(action, input),
+            () => run(input),
+            spec.dangerousAction !== undefined,
+          );
         }
       : run,
   };

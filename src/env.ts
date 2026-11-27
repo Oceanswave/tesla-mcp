@@ -24,6 +24,12 @@ export interface Env {
   /** Comma-separated redirect URIs allowed for OAuth clients beyond the
    * built-in Claude and loopback ones. */
   OAUTH_EXTRA_REDIRECT_URIS: string;
+  /** "true" logs each webhook payload instead of sending it. */
+  NOTIFY_DRY_RUN: string;
+  /** Comma-separated audit actions and outcomes that notify; empty means all.
+   * A denied row notifies regardless. Set in wrangler.jsonc to use them. */
+  NOTIFY_ACTIONS?: string;
+  NOTIFY_OUTCOMES?: string;
 
   MCP_BEARER_TOKEN?: string;
   TESLA_CLIENT_ID?: string;
@@ -33,4 +39,8 @@ export interface Env {
   TESLA_BOOTSTRAP_REFRESH_TOKEN?: string;
   /** Passphrase the owner types on /authorize to approve a client. */
   OAUTH_ADMIN_PASSPHRASE?: string;
+  /** Webhook for audited commands. Unset: no notifications. */
+  NOTIFY_URL?: string;
+  /** The full Authorization header value the webhook expects. */
+  NOTIFY_AUTH?: string;
 }
